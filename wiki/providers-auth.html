@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Models, Providers &amp; Authentication · Hermes Wiki</title>
+  <link rel="stylesheet" href="./style.css">
+  <script src="./vendor/mermaid.min.js"></script>
+  <script>
+    // Local vendored mermaid → renders from file:// offline, no CDN, no missed load-event.
+    window.addEventListener("DOMContentLoaded", function () {
+      if (!window.mermaid) return;
+      try {
+        mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "loose",
+          themeVariables: { fontFamily: "ui-monospace, monospace", fontSize: "13px",
+            primaryColor: "#171b24", primaryBorderColor: "#2d3543", primaryTextColor: "#e7ebf2",
+            lineColor: "#c9a93a", secondaryColor: "#12151c", tertiaryColor: "#0a0c10" } });
+        mermaid.run({ querySelector: "pre.mermaid" });
+      } catch (e) { console.error("mermaid render failed", e); }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="index.html"><span class="mark">☤</span> Hermes Agent <span class="sub">Engineering Wiki</span></a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="self-improvement.html">Self-Improvement</a>
+      <a href="internals.html">Internals</a>
+      <a href="providers-auth.html" class="active">Providers &amp; Auth</a>
+      <a href="faq.html">FAQ</a>
+    </nav>
+  </header>
+  <div class="layout">
+    <aside class="sidebar">
+      <p class="toc-title">On this page</p>
+      <ul>
+        <li><a href="#registry">PROVIDER_REGISTRY — full map</a></li>
+        <li><a href="#anthropic">Anthropic — OAuth, CLAUDE_CODE_OAUTH_TOKEN &amp; Claude Code spoofing</a></li>
+        <li><a href="#codex">OpenAI Codex — ChatGPT subscription OAuth</a></li>
+        <li><a href="#xai">xAI / Grok — API-key only</a></li>
+        <li><a href="#copilot">GitHub Copilot &amp; Copilot-ACP</a></li>
+        <li><a href="#qwen-gemini-nous">Qwen-OAuth, Gemini &amp; Nous Portal</a></li>
+        <li><a href="#storage">Auth storage &amp; runtime resolution</a></li>
+      </ul>
+    </aside>
+    <main>
+<h1 class="page-title">Models, Providers &amp; Authentication</h1>
+<p class="lead">Hermes routes inference through a single <code>PROVIDER_REGISTRY</code> of ~24 providers (<code class="cite">hermes_cli/auth.py:103-294</code>), each tagged with one of <strong>five</strong> auth types. Three of the headline questions users ask — "can I use my Claude Code / ChatGPT / Grok subscription instead of an API key?" — all resolve here. The short answers: Anthropic subscription OAuth <em>works mechanically but violates Anthropic's ToS</em>; an OpenAI ChatGPT subscription is a <em>first-class, OpenAI-endorsed</em> path for Codex models; and xAI/Grok is <em>API-key only</em> with no subscription path at all. This page maps the whole registry, then walks each provider's auth contract with verified verdicts.</p>
+
+<section id="registry">
+<h2>PROVIDER_REGISTRY — full map</h2>
+<p><code>PROVIDER_REGISTRY</code> is a <code>Dict[str, ProviderConfig]</code> defined at <code class="cite">hermes_cli/auth.py:103</code>. Each <code>ProviderConfig</code> (<code class="cite">hermes_cli/auth.py:86-100</code>) carries an <code>id</code>, <code>name</code>, <code>auth_type</code>, <code>portal_base_url</code>, <code>inference_base_url</code>, <code>client_id</code>, <code>scope</code>, <code>api_key_env_vars</code> (a priority-ordered tuple), and a <code>base_url_env_var</code> override.</p>
+
+<div class="callout surprise"><strong>Surprising design.</strong> The dataclass header comment claims three auth types (<code class="cite">hermes_cli/auth.py:91</code>: <code>"oauth_device_code", "oauth_external", or "api_key"</code>), but the registry actually uses <strong>five</strong>: <code>oauth_device_code</code>, <code>oauth_external</code>, <code>api_key</code>, <code>external_process</code> (Copilot ACP), and <code>aws_sdk</code> (Bedrock). And two providers registered as <code>api_key</code> — Anthropic and Copilot — secretly carry full OAuth flows.
+
+<table class="grid">
+<thead><tr><th>id</th><th>name</th><th>auth_type</th><th>inference base URL</th><th>key env vars / OAuth ids</th></tr></thead>
+<tbody>
+<tr><td><code>nous</code></td><td>Nous Portal</td><td><span class="badge partial">oauth_device_code</span></td><td><code>inference-api.nousresearch.com/v1</code></td><td>client_id <code>hermes-cli</code>, scope <code>inference:mint_agent_key</code>, portal <code>portal.nousresearch.com</code></td></tr>
+<tr><td><code>openai-codex</code></td><td>OpenAI Codex</td><td><span class="badge partial">oauth_external</span></td><td><code>chatgpt.com/backend-api/codex</code></td><td>client_id <code>app_EMoamEEZ73f0CkXaXp7hrann</code>, token url <code>auth.openai.com/oauth/token</code></td></tr>
+<tr><td><code>qwen-oauth</code></td><td>Qwen OAuth</td><td><span class="badge partial">oauth_external</span></td><td><code>portal.qwen.ai/v1</code></td><td>client_id <code>f0304373b74a44d2b584a3fb70ca9e56</code>, token url <code>chat.qwen.ai/api/v1/oauth2/token</code> (reads Qwen CLI creds)</td></tr>
+<tr><td><code>copilot</code></td><td>GitHub Copilot</td><td><span class="badge partial">api_key*</span></td><td><code>api.githubcopilot.com</code></td><td><code>COPILOT_GITHUB_TOKEN</code>, <code>GH_TOKEN</code>, <code>GITHUB_TOKEN</code>; *has hidden GitHub device-code OAuth</td></tr>
+<tr><td><code>copilot-acp</code></td><td>GitHub Copilot ACP</td><td><span class="badge unsupported">external_process</span></td><td><code>acp://copilot</code></td><td>none — spawns <code>copilot --acp --stdio</code></td></tr>
+<tr><td><code>gemini</code></td><td>Google AI Studio</td><td><span class="badge yes">api_key</span></td><td><code>generativelanguage.googleapis.com/v1beta/openai</code></td><td><code>GOOGLE_API_KEY</code>, <code>GEMINI_API_KEY</code>; base <code>GEMINI_BASE_URL</code></td></tr>
+<tr><td><code>zai</code></td><td>Z.AI / GLM</td><td><span class="badge yes">api_key</span></td><td><code>api.z.ai/api/paas/v4</code></td><td><code>GLM_API_KEY</code>, <code>ZAI_API_KEY</code>, <code>Z_AI_API_KEY</code></td></tr>
+<tr><td><code>kimi-coding</code></td><td>Kimi / Moonshot</td><td><span class="badge yes">api_key</span></td><td><code>api.moonshot.ai/v1</code></td><td><code>KIMI_API_KEY</code></td></tr>
+<tr><td><code>kimi-coding-cn</code></td><td>Kimi (China)</td><td><span class="badge yes">api_key</span></td><td><code>api.moonshot.cn/v1</code></td><td><code>KIMI_CN_API_KEY</code></td></tr>
+<tr><td><code>arcee</code></td><td>Arcee AI</td><td><span class="badge yes">api_key</span></td><td><code>api.arcee.ai/api/v1</code></td><td><code>ARCEEAI_API_KEY</code></td></tr>
+<tr><td><code>minimax</code></td><td>MiniMax</td><td><span class="badge yes">api_key</span></td><td><code>api.minimax.io/anthropic</code></td><td><code>MINIMAX_API_KEY</code></td></tr>
+<tr><td><code>anthropic</code></td><td>Anthropic</td><td><span class="badge partial">api_key*</span></td><td><code>api.anthropic.com</code></td><td><code>ANTHROPIC_API_KEY</code>, <code>ANTHROPIC_TOKEN</code>, <code>CLAUDE_CODE_OAUTH_TOKEN</code>; *accepts subscription OAuth</td></tr>
+<tr><td><code>alibaba</code></td><td>Alibaba DashScope</td><td><span class="badge yes">api_key</span></td><td><code>dashscope-intl.aliyuncs.com/compatible-mode/v1</code></td><td><code>DASHSCOPE_API_KEY</code></td></tr>
+<tr><td><code>minimax-cn</code></td><td>MiniMax (China)</td><td><span class="badge yes">api_key</span></td><td><code>api.minimaxi.com/anthropic</code></td><td><code>MINIMAX_CN_API_KEY</code></td></tr>
+<tr><td><code>deepseek</code></td><td>DeepSeek</td><td><span class="badge yes">api_key</span></td><td><code>api.deepseek.com/v1</code></td><td><code>DEEPSEEK_API_KEY</code></td></tr>
+<tr><td><code>xai</code></td><td>xAI</td><td><span class="badge yes">api_key</span></td><td><code>api.x.ai/v1</code></td><td><code>XAI_API_KEY</code>; base <code>XAI_BASE_URL</code></td></tr>
+<tr><td><code>ai-gateway</code></td><td>Vercel AI Gateway</td><td><span class="badge yes">api_key</span></td><td><code>ai-gateway.vercel.sh/v1</code></td><td><code>AI_GATEWAY_API_KEY</code></td></tr>
+<tr><td><code>opencode-zen</code></td><td>OpenCode Zen</td><td><span class="badge yes">api_key</span></td><td><code>opencode.ai/zen/v1</code></td><td><code>OPENCODE_ZEN_API_KEY</code></td></tr>
+<tr><td><code>opencode-go</code></td><td>OpenCode Go</td><td><span class="badge yes">api_key</span></td><td><code>opencode.ai/zen/go/v1</code></td><td><code>OPENCODE_GO_API_KEY</code></td></tr>
+<tr><td><code>kilocode</code></td><td>Kilo Code</td><td><span class="badge yes">api_key</span></td><td><code>api.kilo.ai/api/gateway</code></td><td><code>KILOCODE_API_KEY</code></td></tr>
+<tr><td><code>huggingface</code></td><td>Hugging Face</td><td><span class="badge yes">api_key</span></td><td><code>router.huggingface.co/v1</code></td><td><code>HF_TOKEN</code></td></tr>
+<tr><td><code>xiaomi</code></td><td>Xiaomi MiMo</td><td><span class="badge yes">api_key</span></td><td><code>api.xiaomimimo.com/v1</code></td><td><code>XIAOMI_API_KEY</code></td></tr>
+<tr><td><code>ollama-cloud</code></td><td>Ollama Cloud</td><td><span class="badge yes">api_key</span></td><td><code>ollama.com/v1</code></td><td><code>OLLAMA_API_KEY</code></td></tr>
+<tr><td><code>bedrock</code></td><td>AWS Bedrock</td><td><span class="badge unsupported">aws_sdk</span></td><td><code>bedrock-runtime.us-east-1.amazonaws.com</code></td><td>none — boto3 credential chain</td></tr>
+</tbody>
+</table>
+
+<div class="callout info"><strong>Not in the registry.</strong> OpenRouter is the default fall-through, handled separately in <code class="cite">hermes_cli/runtime_provider.py:425</code> (<code>_resolve_openrouter_runtime</code>). Anything that doesn't match a registry provider routes there with <code>OPENROUTER_API_KEY</code>. There is also no generic <code>openai</code> API-key provider — OpenAI's own models reach Hermes only via the Codex subscription path or via OpenRouter / Vercel AI Gateway.</div>
+
+<pre class="mermaid">graph TD
+  A[resolve_runtime_provider] --&gt; N[nous: device-code OAuth -&gt; mint agent-key]
+  A --&gt; C[openai-codex: device+PKCE -&gt; chatgpt.com backend]
+  A --&gt; Q[qwen-oauth: read/refresh ~/.qwen CLI creds]
+  A --&gt; CP[copilot: GitHub device-code OAuth gho_]
+  A --&gt; CA[copilot-acp: spawn copilot --acp --stdio]
+  A --&gt; AN[anthropic: resolve_anthropic_token]
+  A --&gt; BD[bedrock: boto3 chain]
+  A --&gt; K[api_key providers: env var scan]
+  A --&gt; OR[fallthrough: OpenRouter]
+  AN --&gt; AN1{token shape}
+  AN1 --&gt;|sk-ant-api| X[x-api-key header]
+  AN1 --&gt;|sk-ant- / eyJ| B[Bearer + Claude Code spoof]</pre>
+</section>
+
+<section id="anthropic">
+<h2>Anthropic — OAuth, CLAUDE_CODE_OAUTH_TOKEN &amp; Claude Code spoofing</h2>
+<p><span class="badge partial">Partial</span> Registered <code>api_key</code>, but Anthropic is the most elaborate auth path in Hermes. It accepts a regular Console key <em>and</em> a Claude Pro/Max subscription OAuth token, and it even runs its own native PKCE login.</p>
+
+<dl class="spec">
+<dt>Auth type</dt><dd><code>api_key</code> (with full hidden OAuth machinery)</dd>
+<dt>API key path</dt><dd><code>sk-ant-api…</code> Console key → <code>x-api-key</code> header (clean, supported)</dd>
+<dt>Subscription path</dt><dd><code>CLAUDE_CODE_OAUTH_TOKEN</code> / <code>ANTHROPIC_TOKEN</code> / <code>~/.claude/.credentials.json</code> / Hermes-native login → <code>Authorization: Bearer</code> with Claude Code identity spoofing</dd>
+<dt>Env var order</dt><dd><code>ANTHROPIC_API_KEY → ANTHROPIC_TOKEN → CLAUDE_CODE_OAUTH_TOKEN</code> (<code class="cite">hermes_cli/auth.py:192</code>)</dd>
+</dl>
+
+<h3>How the token shape decides the header</h3>
+<p><code>get_anthropic_key()</code> (<code class="cite">hermes_cli/auth.py:301-316</code>) walks the env-var tuple in order. At runtime the agent calls <code>resolve_anthropic_token()</code> (<code class="cite">agent/anthropic_adapter.py:552-593</code>), priority: (1) <code>ANTHROPIC_TOKEN</code>, (2) <code>CLAUDE_CODE_OAUTH_TOKEN</code>, (3) the Claude Code credential file <code>~/.claude/.credentials.json</code> with auto-refresh (<code class="cite">agent/anthropic_adapter.py:328-355</code>), (4) <code>ANTHROPIC_API_KEY</code>. The token <em>shape</em> then chooses the header: <code>_is_oauth_token()</code> (<code class="cite">agent/anthropic_adapter.py:165-186</code>) returns True for <code>sk-ant-</code> (but NOT <code>sk-ant-api</code>) and for <code>eyJ…</code> JWTs. <code>build_anthropic_client()</code> (<code class="cite">agent/anthropic_adapter.py:243-298</code>) sets <code>auth_token=</code> (Bearer) for OAuth tokens and <code>api_key=</code> (x-api-key) for regular keys.</p>
+
+<h3>Claude Code identity spoofing</h3>
+<p>For OAuth requests the client adds beta headers <code>claude-code-20250219</code> + <code>oauth-2025-04-20</code>, a spoofed <code>user-agent: claude-cli/{version} (external, cli)</code>, and <code>x-app: cli</code>. <code>build_anthropic_kwargs</code> on the OAuth path (<code class="cite">agent/anthropic_adapter.py:1281-1318</code>) prepends the <code>"You are Claude Code, Anthropic's official CLI for Claude."</code> system prompt, rewrites brand strings (<code>Hermes Agent</code>→<code>Claude Code</code>, <code>Nous Research</code>→<code>Anthropic</code>), and <code>mcp_</code>-prefixes every tool name. Hermes' own comment is explicit: this is done <code>"to avoid Anthropic's server-side content filters"</code> (<code class="cite">agent/anthropic_adapter.py:1291-1300</code>).</p>
+
+<h3>Hermes-native PKCE login</h3>
+<p>Beyond consuming externally-minted tokens (and shelling out to <code>claude setup-token</code> via <code class="cite">agent/anthropic_adapter.py:596-633</code>), Hermes has its own flow: <code>run_hermes_oauth_login_pure()</code> (<code class="cite">agent/anthropic_adapter.py:660-755</code>) opens <code>claude.ai/oauth/authorize</code> with client_id <code>9d1c250a-e61b-44d9-88ed-5944d1962f5e</code>, scopes <code>org:create_api_key user:profile user:inference</code>, exchanges the pasted code at <code>console.anthropic.com/v1/oauth/token</code>, and stores creds in <code>~/.hermes/.anthropic_oauth.json</code>. The prompt literally reads "Authorize Hermes with your Claude Pro/Max subscription" (<code class="cite">agent/anthropic_adapter.py:682</code>). Refresh (<code class="cite">agent/anthropic_adapter.py:387-448</code>) also write-back-merges scopes into <code>~/.claude/.credentials.json</code> to satisfy Claude Code ≥2.1.81's <code>user:inference</code> gate (<code class="cite">agent/anthropic_adapter.py:472-512</code>).</p>
+
+<div class="callout warn"><strong>Verdict — Claude subscription: <span class="badge partial">Works, but violates ToS.</span></strong> Technically yes, policy-wise no. Hermes accepts <code>CLAUDE_CODE_OAUTH_TOKEN</code>, setup-tokens, Claude Code credentials, and has its own login — and will make subscription-backed inference calls. But it <em>only</em> works by impersonating the first-party Claude Code client. Anthropic's Legal &amp; Compliance doc states OAuth auth is "intended exclusively" for native Anthropic apps and "does not permit third-party developers to route requests through Free, Pro, or Max plan credentials." Since January 2026 Anthropic has been actively blocking exactly these spoofing harnesses (OpenCode, Roo, Goose, Cursor, Manus, Pi) and suspending accounts "without prior notice." A plain Bearer of an <code>sk-ant-oat</code> token without the Claude Code fingerprint returns 401 "OAuth authentication is currently not supported."</div>
+
+<div class="callout key"><strong>Key insight — the only legitimate Anthropic path.</strong> A pay-as-you-go Console API key (<code>sk-ant-api…</code>) under the Commercial Terms is the only unambiguously permitted option: <code>export ANTHROPIC_API_KEY=sk-ant-api...</code> routes through <code>x-api-key</code> with no spoofing. An API key is <em>not</em> the only credential Hermes will accept — but it is the only one Anthropic permits. The June 15 2026 Agent SDK subscription credit is also blessed, but it flows through the native Agent SDK, not a third-party harness.</div>
+</section>
+
+<section id="codex">
+<h2>OpenAI Codex — ChatGPT subscription OAuth</h2>
+<p><span class="badge yes">Yes</span> You sign in with a ChatGPT subscription (Plus/Pro/Team/Business/Enterprise/Edu) to drive Codex models — entirely separate from any OpenAI API key. The access token <em>is</em> the credential; there is no API-key path for Codex models in Hermes.</p>
+
+<dl class="spec">
+<dt>Auth type</dt><dd><code>oauth_external</code> (<code class="cite">hermes_cli/auth.py:113-118</code>)</dd>
+<dt>Base URL</dt><dd><code>chatgpt.com/backend-api/codex</code> — the same subscription-billed endpoint the official Codex CLI uses</dd>
+<dt>OAuth client</dt><dd>client_id <code>app_EMoamEEZ73f0CkXaXp7hrann</code>, token url <code>auth.openai.com/oauth/token</code> (<code class="cite">hermes_cli/auth.py:69-79</code>)</dd>
+<dt>Billing</dt><dd>Counts against your ChatGPT plan's included Codex limits — <strong>not</strong> metered API billing</dd>
+</dl>
+
+<h3>Device-code + PKCE login</h3>
+<p><code>_login_openai_codex()</code> (<code class="cite">hermes_cli/auth.py:2845-2907</code>) first tries Hermes-stored creds, then optionally imports the Codex CLI's <code>~/.codex/auth.json</code> via <code>_import_codex_cli_tokens()</code> (<code class="cite">hermes_cli/auth.py:1494-1525</code>), else runs <code>_codex_device_code_login()</code> (<code class="cite">hermes_cli/auth.py:2910-3052</code>): POST to <code>auth.openai.com/api/accounts/deviceauth/usercode</code>, show the user <code>auth.openai.com/codex/device</code> + a user code, poll for the authorization code, then PKCE-exchange it at <code>auth.openai.com/oauth/token</code>.</p>
+
+<h3>Independent session, synced write-back</h3>
+<p>Hermes stores its <em>own</em> Codex session in <code>~/.hermes/auth.json</code> under provider <code>openai-codex</code> with <code>auth_mode="chatgpt"</code> (<code class="cite">hermes_cli/auth.py:1363-1374</code>), deliberately <em>not</em> in <code>~/.codex/</code>. OpenAI rotates refresh tokens (single-use), so <code>_refresh_codex_auth_tokens()</code> (<code class="cite">hermes_cli/auth.py:1467-1491</code>) writes the new pair both to Hermes' store and back to <code>~/.codex/auth.json</code> to keep the Codex CLI in sync. Runtime: <code>resolve_codex_runtime_credentials()</code> (<code class="cite">hermes_cli/auth.py:1528-1588</code>) returns the access token as <code>api_key</code>, mapped to <code>api_mode="codex_responses"</code> (<code class="cite">hermes_cli/runtime_provider.py:769-787</code>). Model discovery hits <code>chatgpt.com/backend-api/codex/models</code> with a Bearer token (<code class="cite">hermes_cli/codex_models.py:55-90</code>).</p>
+
+<div class="callout key"><strong>Verdict — ChatGPT subscription drives Codex: <span class="badge yes">Yes, supported &amp; endorsed.</span></strong> This is the <em>primary</em> path for OpenAI's models in Hermes, not an afterthought. OpenAI publicly endorses personal reuse ("use Codex and your ChatGPT subscription wherever you like"), and the Codex CLI is Apache-2.0. <strong>How-to (Option A):</strong> run <code>hermes auth</code> / <code>hermes login</code>, pick "OpenAI Codex", open <code>auth.openai.com/codex/device</code>, sign in, enter the code. <strong>Option B:</strong> sign into the official Codex CLI so <code>~/.codex/auth.json</code> exists — Hermes imports it automatically.</div>
+
+<div class="callout warn"><strong>ToS &amp; gaps.</strong> The <code>backend-api/codex</code> endpoint is undocumented/"semi-official" and can change without notice. OpenAI terms prohibit circumventing usage limits, pooling/transferring credentials, and reselling — honest single-user reuse is the tolerated zone; multi-account pooling or shared-service deployment is a ban risk. <strong>Verified gap:</strong> Hermes sets <em>no</em> <code>originator</code> (default <code>codex_cli_rs</code>) or <code>chatgpt-account-id</code> header — Codex requests go out as a bare <code>Authorization: Bearer</code>. Default headers in <code class="cite">run_agent.py:958-1041</code> are only added for OpenRouter/Copilot/Kimi/Qwen, never Codex. If OpenAI enforces originator-based gating, Hermes' Codex calls could begin failing.</div>
+</section>
+
+<section id="xai">
+<h2>xAI / Grok — API-key only</h2>
+<p><span class="badge no">No subscription path</span> xAI/Grok is integrated, but strictly as a plain API-key provider. There is no xAI OAuth, no device-code/login flow, and no integration with xAI's own "Grok Build" CLI or SuperGrok subscription.</p>
+
+<dl class="spec">
+<dt>Auth type</dt><dd><code>api_key</code> (<code class="cite">hermes_cli/auth.py:218-225</code>)</dd>
+<dt>Base URL</dt><dd><code>api.x.ai/v1</code>, override <code>XAI_BASE_URL</code></dd>
+<dt>Env var</dt><dd><code>XAI_API_KEY</code> (the sole env var)</dd>
+<dt>Console</dt><dd><code>console.x.ai</code> — the pay-per-token developer API console (<code class="cite">hermes_cli/config.py:849-857</code>)</dd>
+<dt>Default models</dt><dd><code>grok-4.20-reasoning</code>, <code>grok-4-1-fast-reasoning</code> (<code class="cite">hermes_cli/models.py:147-150</code>)</dd>
+</dl>
+
+<p>No xAI-specific login dispatcher exists anywhere — <code>xai</code> never appears in any <code>_login_*</code> / device-code / OAuth path. <code>tools/xai_http.py</code> is a 13-line User-Agent helper (<code>hermes_xai_user_agent()</code>, <code class="cite">tools/xai_http.py:6-12</code>) with no auth logic. Aliases <code>grok</code>, <code>x-ai</code>, <code>x.ai</code> all normalize to provider <code>xai</code> (<code class="cite">hermes_cli/auth.py:931</code>).</p>
+
+<div class="callout surprise"><strong>Surprising design.</strong> At runtime xAI is routed through the <strong>Codex Responses API adapter</strong> — <code class="cite">hermes_cli/runtime_provider.py:933-934</code> sets <code>api_mode="codex_responses"</code> for <code>provider == "xai"</code>. So Grok shares the Responses request format with OpenAI Codex, yet still authenticates with a plain <code>XAI_API_KEY</code> bearer via the generic resolver (<code class="cite">hermes_cli/auth.py:2488-2523</code>). This is a request-format coupling, not an auth linkage.</div>
+
+<div class="callout info"><strong>Verdict — Grok subscription: <span class="badge unsupported">Not possible.</span></strong> A consumer SuperGrok / X Premium+ subscription cannot be used as programmatic credentials — Hermes only accepts a <code>console.x.ai</code> pay-per-token <code>XAI_API_KEY</code> (or OpenRouter's <code>grok-code-fast-1</code> via <code>OPENROUTER_API_KEY</code>). xAI's official "Grok Build" CLI is a separate first-party product Hermes does not wrap. <strong>How-to:</strong> create a key at <code>console.x.ai</code>, <code>export XAI_API_KEY=xai-...</code>, select a Grok model.</div>
+</section>
+
+<section id="copilot">
+<h2>GitHub Copilot &amp; Copilot-ACP</h2>
+<p>Two distinct providers, two very different auth models.</p>
+
+<h3>copilot — hidden GitHub device-code OAuth</h3>
+<p><span class="badge partial">api_key, but OAuth under the hood</span> Registered <code>auth_type="api_key"</code> (<code class="cite">hermes_cli/auth.py:125-132</code>), yet it ships a real GitHub device-code flow. <code>validate_copilot_token</code> (<code class="cite">hermes_cli/copilot_auth.py:46-64</code>) accepts <code>gho_</code> (OAuth), <code>github_pat_</code> (fine-grained PAT with Copilot Requests permission), and <code>ghu_</code> (GitHub App) prefixes — classic <code>ghp_</code> PATs are rejected. <code>resolve_copilot_token()</code> (<code class="cite">hermes_cli/copilot_auth.py:67-95</code>) checks <code>COPILOT_GITHUB_TOKEN → GH_TOKEN → GITHUB_TOKEN</code>, then falls back to <code>gh auth token</code> (<code class="cite">hermes_cli/copilot_auth.py:119-150</code>). The interactive login <code>copilot_device_code_login()</code> (<code class="cite">hermes_cli/copilot_auth.py:155-275</code>) runs the GitHub OAuth device flow with client_id <code>Ov23li8tweQw6odWQebz</code> (the opencode/Copilot-CLI app id), scope <code>read:user</code>, polling <code>github.com/login/oauth/access_token</code>; the resulting token is saved via <code>save_env_value("COPILOT_GITHUB_TOKEN", token)</code> (<code class="cite">hermes_cli/main.py:2122-2128</code>). Requests carry editor-spoofing headers (<code>Editor-Version: vscode/1.104.1</code>, <code>Copilot-Integration-Id: vscode-chat</code>). The secret resolver special-cases copilot (<code class="cite">hermes_cli/auth.py:375-386</code>).</p>
+
+<div class="callout key"><strong>Verdict — GitHub Copilot subscription: <span class="badge yes">Yes, via device-code OAuth.</span></strong> A Copilot subscription works as a model backend; the <code>gho_</code> token from the GitHub device flow is the credential.</div>
+
+<h3>copilot-acp — external subprocess</h3>
+<p><span class="badge unsupported">external_process</span> Base <code>acp://copilot</code> (<code class="cite">hermes_cli/auth.py:133-139</code>). This shells out to the Copilot CLI itself — there is no token. <code>resolve_external_process_provider_credentials()</code> (<code class="cite">hermes_cli/auth.py:2526-2563</code>) resolves the command (<code>HERMES_COPILOT_ACP_COMMAND</code> / <code>COPILOT_CLI_PATH</code> / <code>copilot</code>) and args (default <code>--acp --stdio</code>), returning a placeholder <code>api_key="copilot-acp"</code>. Auth is delegated entirely to whatever the Copilot CLI process is logged into. <code>CopilotACPClient</code> (<code class="cite">agent/copilot_acp_client.py:256-347</code>) spawns <code>copilot --acp --stdio</code> per request and speaks JSON-RPC/ACP over stdio.</p>
+</section>
+
+<section id="qwen-gemini-nous">
+<h2>Qwen-OAuth, Gemini &amp; Nous Portal</h2>
+
+<h3>Qwen-OAuth — parasitic on the Qwen CLI</h3>
+<p><span class="badge partial">oauth_external</span> Base <code>portal.qwen.ai/v1</code> (<code class="cite">hermes_cli/auth.py:119-124</code>). Crucially, Hermes does <em>not</em> run its own Qwen device flow — it reads and refreshes the Qwen CLI's credential file <code>~/.qwen/oauth_creds.json</code> (<code class="cite">hermes_cli/auth.py:1084-1109</code>). If missing it errors "Run 'qwen auth qwen-oauth' first." Refresh (<code class="cite">hermes_cli/auth.py:1131-1200</code>) POSTs to <code>chat.qwen.ai/api/v1/oauth2/token</code> and writes the rotated pair back to the Qwen CLI file. <code>resolve_qwen_runtime_credentials()</code> (<code class="cite">hermes_cli/auth.py:1203-1232</code>) returns <code>source="qwen-cli"</code>, <code>api_mode="chat_completions"</code>.</p>
+<div class="callout surprise"><strong>Surprising design.</strong> Qwen "OAuth" mints no tokens of its own — it is effectively a parasitic session on the official Qwen CLI login. It is a subscription/OAuth provider, but only because the Qwen CLI did the logging-in.</div>
+
+<h3>Gemini — pure API key</h3>
+<p><span class="badge yes">api_key</span> OpenAI-compatible base <code>generativelanguage.googleapis.com/v1beta/openai</code>, env <code>GOOGLE_API_KEY</code>/<code>GEMINI_API_KEY</code> (<code class="cite">hermes_cli/auth.py:140-147</code>). No OAuth, no Google subscription login — a Google AI Studio API key only.</p>
+
+<h3>Nous Portal — the canonical subscription provider</h3>
+<p><span class="badge partial">oauth_device_code</span> The flagship subscription provider (<code class="cite">hermes_cli/auth.py:104-112</code>): client_id <code>hermes-cli</code>, scope <code>inference:mint_agent_key</code>, portal <code>portal.nousresearch.com</code>. <code>_nous_device_code_login()</code> (<code class="cite">hermes_cli/auth.py:3055</code>) opens the portal verification URL and obtains an OAuth access+refresh token. At runtime, <code>resolve_nous_runtime_credentials()</code> reads provider state, refreshes if expiring, then <strong>mints a short-lived inference key</strong> via <code>_mint_agent_key()</code> (<code class="cite">hermes_cli/auth.py:1749-1779</code>) — POST <code>{portal}/api/oauth/agent-key</code> with the OAuth bearer and a <code>min_ttl_seconds</code> (default 1800s), caching it as <code>state["agent_key"]</code> and reusing until within TTL (<code class="cite">hermes_cli/auth.py:1839-1843</code>). The minted agent key (not the OAuth token) is what hits the inference API. A separate <code>nous_subscription.py</code> layer maps the subscription to managed tool features (web search, image-gen, TTS, browser, modal), gated on <code>NousSubscriptionFeatures</code> (<code class="cite">hermes_cli/nous_subscription.py:41-71</code>).</p>
+</section>
+
+<section id="storage">
+<h2>Auth storage &amp; runtime resolution</h2>
+<p>All Hermes-owned OAuth/credential state lives in <code>~/.hermes/auth.json</code> (<code class="cite">hermes_cli/auth.py:571</code>), guarded by a reentrant cross-process advisory lock (<code class="cite">hermes_cli/auth.py:581-597</code>, fcntl/msvcrt, <code>AUTH_LOCK_TIMEOUT_SECONDS=15</code> at <code class="cite">hermes_cli/auth.py:59</code>). The one exception is Anthropic's native OAuth, stored separately in <code>~/.hermes/.anthropic_oauth.json</code> (<code class="cite">agent/anthropic_adapter.py:644</code>).</p>
+
+<table class="grid">
+<thead><tr><th>File</th><th>Owner</th><th>Hermes access</th></tr></thead>
+<tbody>
+<tr><td><code>~/.hermes/auth.json</code></td><td>Hermes</td><td>read/write — all provider OAuth state</td></tr>
+<tr><td><code>~/.hermes/.anthropic_oauth.json</code></td><td>Hermes</td><td>read/write — native Anthropic PKCE creds</td></tr>
+<tr><td><code>~/.claude/.credentials.json</code></td><td>Claude Code CLI</td><td>read + refresh write-back (scopes merge)</td></tr>
+<tr><td><code>~/.codex/auth.json</code></td><td>Codex CLI</td><td>import + refresh write-back (sync)</td></tr>
+<tr><td><code>~/.qwen/oauth_creds.json</code></td><td>Qwen CLI</td><td>read + refresh write-back</td></tr>
+</tbody>
+</table>
+
+<h3>Runtime dispatch</h3>
+<p><code>resolve_runtime_provider()</code> (<code class="cite">hermes_cli/runtime_provider.py:656-966</code>) is the central dispatcher. It branches per provider: Nous→mint agent key (<code class="cite">hermes_cli/runtime_provider.py:748</code>); Codex→<code>codex_responses</code> (769); Qwen→<code>chat_completions</code> (789); copilot-acp→external process (807); anthropic→<code>resolve_anthropic_token</code> + <code>anthropic_messages</code> (821); bedrock→boto3 chain (847); then the generic <code>api_key</code> branch for all remaining providers (<code class="cite">hermes_cli/runtime_provider.py:918-958</code>) with special api_mode handling (copilot, <code>xai</code>→<code>codex_responses</code>, opencode, <code>/anthropic</code>-suffix auto-detect). Anything unmatched falls through to OpenRouter (<code class="cite">hermes_cli/runtime_provider.py:960</code>).</p>
+
+<div class="callout info"><strong>Auto-fallthrough.</strong> When the requested provider is <code>"auto"</code>, OAuth providers that fail credential resolution log and fall through to the next provider — e.g. Codex→OpenRouter (<code class="cite">hermes_cli/runtime_provider.py:781-787</code>). The generic secret resolver <code>_resolve_api_key_provider_secret</code> (<code class="cite">hermes_cli/auth.py:371-393</code>) special-cases copilot to <code>resolve_copilot_token()</code> and otherwise scans <code>api_key_env_vars</code>, filtering placeholder values via <code>has_usable_secret</code> (<code class="cite">hermes_cli/auth.py:359-368</code>).</div>
+</section>
+    </main>
+  </div>
+  <footer>
+    Hermes Agent engineering wiki · generated from a source-grounded multi-agent analysis of
+    <code>IgorTavcar/hermes-agent</code> (fork of <code>NousResearch/hermes-agent</code>).
+    Citations are <code>path:line</code> into the repo at analysis time. Diagrams render with
+    mermaid.js (needs network); otherwise they appear as text.
+  </footer>
+  <script>
+    // scrollspy: highlight the current section in the sidebar
+    const links = [...document.querySelectorAll('.sidebar a')];
+    const map = new Map(links.map(a => [a.getAttribute('href').slice(1), a]));
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          links.forEach(a => a.classList.remove('active'));
+          const a = map.get(e.target.id);
+          if (a) a.classList.add('active');
+        }
+      });
+    }, { rootMargin: '-80px 0px -70% 0px' });
+    document.querySelectorAll('main section[id]').forEach(s => obs.observe(s));
+  </script>
+</body>
+</html>

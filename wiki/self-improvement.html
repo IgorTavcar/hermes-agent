@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>The Closed Learning Loop: How Hermes Adapts Over Time · Hermes Wiki</title>
+  <link rel="stylesheet" href="./style.css">
+  <script src="./vendor/mermaid.min.js"></script>
+  <script>
+    // Local vendored mermaid → renders from file:// offline, no CDN, no missed load-event.
+    window.addEventListener("DOMContentLoaded", function () {
+      if (!window.mermaid) return;
+      try {
+        mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "loose",
+          themeVariables: { fontFamily: "ui-monospace, monospace", fontSize: "13px",
+            primaryColor: "#171b24", primaryBorderColor: "#2d3543", primaryTextColor: "#e7ebf2",
+            lineColor: "#c9a93a", secondaryColor: "#12151c", tertiaryColor: "#0a0c10" } });
+        mermaid.run({ querySelector: "pre.mermaid" });
+      } catch (e) { console.error("mermaid render failed", e); }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="index.html"><span class="mark">☤</span> Hermes Agent <span class="sub">Engineering Wiki</span></a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="self-improvement.html" class="active">Self-Improvement</a>
+      <a href="internals.html">Internals</a>
+      <a href="providers-auth.html">Providers &amp; Auth</a>
+      <a href="faq.html">FAQ</a>
+    </nav>
+  </header>
+  <div class="layout">
+    <aside class="sidebar">
+      <p class="toc-title">On this page</p>
+      <ul>
+        <li><a href="#overview">What a closed loop means here</a></li>
+        <li><a href="#curated-memory">Curated memory and self-nudges</a></li>
+        <li><a href="#background-review">The background review fork</a></li>
+        <li><a href="#skill-creation">Autonomous skill creation</a></li>
+        <li><a href="#skill-self-improve">Skills that self-improve during use</a></li>
+        <li><a href="#session-recall">FTS5 session search and cross-session recall</a></li>
+        <li><a href="#soul-insights">SOUL, USER.md, and the insights model</a></li>
+        <li><a href="#honcho">Honcho dialectic user modeling</a></li>
+        <li><a href="#loop-diagram">The full learning loop</a></li>
+        <li><a href="#honest-ledger">Honest ledger: real loop vs aspiration</a></li>
+      </ul>
+    </aside>
+    <main>
+<h1 class="page-title">The Closed Learning Loop: How Hermes Adapts Over Time</h1>
+<p class="lead">Most agents are stateless between sessions: every conversation starts from the same blank system prompt. Hermes is designed around the opposite premise — that the artifacts of one conversation should change the prompt of the next. This page traces each adaptation mechanism concretely: what fires it, what it reads and writes, where the result persists, and exactly how that persisted state re-enters a future prompt. Some of these form a genuinely closed loop today; others are real but human-in-the-loop, and a couple are honestly aspirational. We mark which is which.</p>
+
+<div class="callout key"><strong>Key insight.</strong> A "learning loop" is only closed when the output of one turn is written to durable storage and then automatically read back into a later prompt <em>without a human re-typing it</em>. Hermes has several mechanisms that meet that bar (memory writes, skill creation, frozen-snapshot recall) and several that assist a human-driven loop (session search, insights reporting). The honest distinction is the whole point of this page.</div>
+
+<section id="overview">
+<h2>What a closed loop means here</h2>
+<p>Every mechanism below is an instance of the same three-stage pattern. It is worth holding this template in mind, because the differences between the mechanisms are entirely in <em>where</em> each stage lives.</p>
+<dl class="spec">
+<dt>Trigger</dt><dd>What causes the adaptation to run — a turn counter crossing a threshold, a tool call, a compression event, or an explicit user command.</dd>
+<dt>Read / write</dt><dd>What state the mechanism consults and what durable artifact it produces (a Markdown file, a SQLite row, a skill directory, a remote representation).</dd>
+<dt>Persistence</dt><dd>Where the artifact lives across sessions, and crucially, whether it survives a process restart with no human involvement.</dd>
+<dt>Feedback</dt><dd>The closing move: how the persisted artifact is re-injected into a future system prompt or recalled mid-conversation.</dd>
+</dl>
+<p>Two architectural facts shape every mechanism. First, memory is read into the system prompt as a <strong>frozen snapshot at session start</strong>: mid-session writes hit disk immediately and durably, but the in-context copy is not rebuilt until the next session, which preserves the model provider's prefix cache for the whole conversation (<code class="cite">tools/memory_tool.py:11</code>). Second, the heavier adaptation work (deciding what to remember, whether to write a skill) is deferred to a <strong>background fork</strong> that runs after the user's answer is delivered, so introspection never competes with the task for the model's attention (<code class="cite">run_agent.py:11268</code>).</p>
+</section>
+
+<section id="curated-memory">
+<h2>Curated memory and self-nudges</h2>
+<p>The built-in memory provider is always present and cannot be removed; at most one external provider runs alongside it (<code class="cite">agent/memory_provider.py:1</code>, <code class="cite">agent/memory_manager.py:104</code>). It backs two bounded Markdown files in the profile's <code>memories/</code> directory:</p>
+<table class="grid">
+<thead><tr><th>File</th><th>Holds</th><th>Default bound</th></tr></thead>
+<tbody>
+<tr><td><code>MEMORY.md</code></td><td>The agent's own notes — environment facts, project conventions, tool quirks, things learned</td><td>2200 chars</td></tr>
+<tr><td><code>USER.md</code></td><td>What the agent knows about you — preferences, communication style, expectations, workflow habits</td><td>1375 chars</td></tr>
+</tbody>
+</table>
+<p>The stores are deliberately <strong>bounded and curated</strong> rather than append-only logs (<code class="cite">tools/memory_tool.py:5</code>, <code class="cite">tools/memory_tool.py:116</code>). A write that would exceed the char limit is rejected with an explanatory error, forcing the model to consolidate rather than accumulate (<code class="cite">tools/memory_tool.py:254</code>). Entries are separated by a section-sign delimiter and edited by short unique-substring matching — there are no IDs to track, so the model adds, replaces, removes, or reads by content (<code class="cite">tools/memory_tool.py:57</code>). Character limits are used instead of token limits precisely because char counts are model-independent.</p>
+
+<h3>Trigger: the periodic nudge</h3>
+<p>Memory is not written only when the user says "remember this." A turn counter (<code>_turns_since_memory</code>) increments every user turn; when it reaches the configurable nudge interval (default 10), a memory review is flagged for that turn (<code class="cite">run_agent.py:8308</code>, <code class="cite">run_agent.py:1203</code>). A parallel counter, <code>_iters_since_skill</code>, tracks tool-calling iterations and flags a skill review at its own interval (<code class="cite">run_agent.py:11252</code>). Both intervals are config-driven and can be set to 0 to disable. The counters reset when the relevant tool is actually used, so an agent that just wrote a memory is not nagged again immediately (<code class="cite">run_agent.py:7682</code>).</p>
+
+<h3>Persistence and feedback</h3>
+<p>Writes are durable the instant they happen — the file on disk is updated immediately. But the copy the model is reasoning over is the frozen snapshot from session start, so the new entry does not become <em>active context</em> until the next session rebuilds the system prompt (<code class="cite">tools/memory_tool.py:11</code>). This is the closing edge of the loop: a preference saved to <code>USER.md</code> on Monday is part of the identity slot of Tuesday's first prompt, with no human re-statement. The system prompt itself is cached per session and only rebuilt after compression or a fresh session, which is what keeps the prefix cache stable (<code class="cite">run_agent.py:8336</code>).</p>
+
+<h3>The pre-compression flush</h3>
+<p>There is a second, event-driven write path. Before context compression, a session reset, or CLI exit, <code>flush_memories()</code> gives the model exactly one turn — with only the memory tool exposed — to persist anything worth keeping before the raw transcript is discarded (<code class="cite">run_agent.py:6972</code>). The injected flush prompt explicitly prioritizes "user preferences, corrections, and recurring patterns over task-specific details," and all flush artifacts are stripped from the message list afterward so they never pollute the transcript (<code class="cite">run_agent.py:6999</code>). This is a real closed-loop edge: information about to be lost to compression is salvaged into durable memory automatically.</p>
+</section>
+
+<section id="background-review">
+<h2>The background review fork</h2>
+<p>The nudge counters do not interrupt the conversation. Instead, after the response is delivered and only if the turn was not interrupted, Hermes spawns a daemon thread that forks a full second agent to do the introspection (<code class="cite">run_agent.py:11268</code>, <code class="cite">run_agent.py:2358</code>). This is the engine that drives both curated-memory writes and autonomous skill creation, so it is worth understanding in detail.</p>
+<p>The fork is a complete <code>AIAgent</code> with the same model and provider, capped at 8 iterations, running in quiet mode with stdout/stderr redirected to <code>/dev/null</code> so it produces no visible output (<code class="cite">run_agent.py:2388</code>). It shares the parent's memory and skill stores by reference, and its own nudge intervals are zeroed so it cannot recurse (<code class="cite">run_agent.py:2395</code>). The parent's conversation snapshot is passed as <code>conversation_history</code>, and one of three review prompts is appended as the next user turn (<code class="cite">run_agent.py:2401</code>).</p>
+<p>The prompts are concrete and skeptical. The memory prompt asks whether the user revealed persona, preferences, or behavioral expectations; the skill prompt asks whether a non-trivial approach was used that required trial and error or course correction; the combined prompt asks both. All three end with the same escape hatch: "If nothing is worth saving, just say 'Nothing to save.' and stop" (<code class="cite">run_agent.py:2323</code>, <code class="cite">run_agent.py:2344</code>). After the fork runs, the parent scans the fork's tool results for successful create/update/add actions and surfaces a compact one-line summary (for example, <code>💾 User profile updated</code>) so the user sees that learning happened without seeing the deliberation (<code class="cite">run_agent.py:2408</code>).</p>
+<div class="callout surprise"><strong>Surprising design.</strong> Hermes uses a second, hidden instance of itself to decide what the first instance should learn. The introspection runs on the user's own model with the full conversation as context, but writes to shared storage on a background thread — so the cost is a few extra tokens after the answer is already on screen, not added latency to the reply.</div>
+</section>
+
+<section id="skill-creation">
+<h2>Autonomous skill creation</h2>
+<p>Skills are Hermes's <em>procedural</em> memory — narrow, actionable "how to do this specific kind of task" knowledge — as distinct from the broad declarative facts in <code>MEMORY.md</code> and <code>USER.md</code> (<code class="cite">tools/skill_manager_tool.py:10</code>). A skill is a directory with a <code>SKILL.md</code> (YAML frontmatter plus a body) and optional <code>references/</code>, <code>templates/</code>, <code>scripts/</code>, and <code>assets/</code> subdirectories (<code class="cite">tools/skill_manager_tool.py:22</code>).</p>
+<h3>Trigger and write</h3>
+<p>The skill-review branch of the background fork fires when <code>_iters_since_skill</code> crosses the skill nudge interval — that is, after a turn that took many tool iterations, which is a proxy for "this was a hard, multi-step task" (<code class="cite">run_agent.py:11252</code>). The fork is handed the skill review prompt and the conversation; if it judges the approach reusable, it calls <code>skill_manage(action='create')</code> to write a new skill into <code>~/.hermes/skills/</code> (<code class="cite">tools/skill_manager_tool.py:6</code>). If a relevant skill already exists, the prompt directs it to update that one instead (<code class="cite">run_agent.py:2334</code>).</p>
+<div class="callout warn"><strong>Caveat.</strong> Agent-created skills get the same security scrutiny as community installs. Every write is scanned by the skills guard; a "dangerous" or "ask" verdict blocks the skill outright and returns the scan report rather than silently writing it (<code class="cite">tools/skill_manager_tool.py:56</code>). Autonomous authorship does not mean unaudited authorship.</div>
+<h3>Persistence and feedback</h3>
+<p>The new skill lives on disk in the local skills directory, the single source of truth for user skills (<code class="cite">tools/skill_manager_tool.py:81</code>). On the next session, the prompt builder scans every <code>SKILL.md</code> and folds its name and one-line description into a compact, cached skill index in the system prompt (<code class="cite">agent/prompt_builder.py:583</code>). That index carries a mandatory instruction: scan the listed skills before replying and load any that are even partially relevant with <code>skill_view(name)</code> (<code class="cite">agent/prompt_builder.py:777</code>). So a skill the agent wrote for itself yesterday becomes a discoverable, loadable capability today — a closed loop whose currency is procedural knowledge rather than facts.</p>
+</section>
+
+<section id="skill-self-improve">
+<h2>Skills that self-improve during use</h2>
+<p>The previous mechanism creates skills after the fact. This one improves them <em>in the moment they are used</em>, and it is one of the cleaner closed loops in the system. The skill index header that ships in every system prompt contains two standing instructions beyond "load relevant skills" (<code class="cite">agent/prompt_builder.py:789</code>):</p>
+<pre><code>If a skill has issues, fix it with skill_manage(action='patch').
+After difficult/iterative tasks, offer to save as a skill.
+If a skill you loaded was missing steps, had wrong commands, or needed
+pitfalls you discovered, update it before finishing.</code></pre>
+<p>Because this guidance is in the prompt of the <em>primary</em> agent (not the background fork), the agent is directed to correct a skill while still inside the task that exposed the flaw. The <code>patch</code> action does a targeted find-and-replace inside <code>SKILL.md</code> or any supporting file, so the agent can surgically fix a wrong command or add a newly discovered pitfall without rewriting the whole skill (<code class="cite">tools/skill_manager_tool.py:17</code>). The next agent that loads that skill reads the corrected version straight from disk — no re-derivation of the fix required.</p>
+<div class="callout key"><strong>Key insight.</strong> This is the tightest loop in Hermes: the artifact being read (the skill) and the artifact being written (the patched skill) are the same file, and the write happens during the very task that revealed the defect. A wrong command discovered at 2pm is gone for every future invocation by 2:05pm, persisted on disk, with the human only optionally in the loop.</div>
+</section>
+
+<section id="session-recall">
+<h2>FTS5 session search and cross-session recall</h2>
+<p>Memory and skills capture <em>distilled</em> knowledge. Session search provides recall over the <em>raw</em> history: every past conversation transcript is stored in SQLite and made searchable through an FTS5 full-text index (<code class="cite">tools/session_search_tool.py:1</code>). This is recall, not background learning — it fires when the model decides it needs it.</p>
+<h3>Flow</h3>
+<p>The <code>session_search</code> tool has two modes. With no query it lists recent sessions (titles, previews, timestamps) at zero LLM cost. With a query it runs the FTS5 search, groups the top matches into unique sessions, and then — rather than dumping raw transcripts into the main context — summarizes each matching session with a cheap auxiliary model and returns focused recaps (<code class="cite">tools/session_search_tool.py:297</code>, <code class="cite">tools/session_search_tool.py:175</code>). Several details make this robust:</p>
+<ul>
+<li><strong>Match-centered truncation.</strong> Each session is truncated to ~100k chars around a window chosen to maximize coverage of the query's actual hit positions, biased 25% before / 75% after each match (<code class="cite">tools/session_search_tool.py:90</code>).</li>
+<li><strong>Lineage resolution.</strong> Child sessions created by compression or delegation are walked back to their root parent, and the <em>current</em> conversation's lineage is excluded — the agent already has that context (<code class="cite">tools/session_search_tool.py:356</code>).</li>
+<li><strong>Parallel summarization with graceful fallback.</strong> Sessions are summarized concurrently; if the summarizer is unavailable, the matched session falls back to a raw preview rather than being silently dropped (<code class="cite">tools/session_search_tool.py:468</code>).</li>
+</ul>
+<h3>Feedback into the prompt</h3>
+<p>The tool description tells the model to search <em>proactively</em> on cues like "we did this before," "remember when," or "last time," and even when it suspects it solved a similar problem before (<code class="cite">tools/session_search_tool.py:511</code>). The returned summaries enter the working context as a tool result. This makes the loop <strong>pull-based and conversational</strong>: recall happens because the model reached for it, not because a counter expired. It is a genuine cross-session capability — the search spans all prior sessions — but it closes the loop only when the model elects to query.</p>
+</section>
+
+<section id="soul-insights">
+<h2>SOUL, USER.md, and the insights model</h2>
+<p>The model the agent holds of itself and of you spans three artifacts, each filling a different slot.</p>
+<dl class="spec">
+<dt>SOUL.md</dt><dd>The agent's identity, loaded as slot #1 of the system prompt when present (<code class="cite">agent/prompt_builder.py:893</code>, <code class="cite">run_agent.py:3349</code>). On first run a default template is seeded into <code>HERMES_HOME</code> (<code class="cite">hermes_cli/default_soul.py:3</code>). It is user-authored persona, not auto-learned — editing it changes who the agent is for every future session.</dd>
+<dt>USER.md</dt><dd>The agent's model of you, written by the curated-memory loop described above and re-injected as the frozen snapshot on each session start. This is the auto-learned half of the self/user model.</dd>
+<dt>Insights</dt><dd>An analytical model of your usage, not your identity. <code>InsightsEngine</code> queries the session database to produce token consumption, cost estimates, tool-usage patterns, and activity trends, surfaced via the <code>/insights</code> command (<code class="cite">agent/insights.py:1</code>, <code class="cite">agent/insights.py:93</code>).</dd>
+</dl>
+<div class="callout info"><strong>Worth being precise here.</strong> SOUL.md and USER.md feed directly back into future prompts and are part of the closed loop. The insights engine is a <em>reporting</em> layer — it reads the database and renders a report for the human; nothing it computes is automatically written back into the agent's prompt. It informs <em>your</em> decisions about the agent, which is valuable, but it is not a self-improvement loop in the strict sense.</div>
+</section>
+
+<section id="honcho">
+<h2>Honcho dialectic user modeling</h2>
+<p>The optional <a href="https://github.com/plastic-labs/honcho">Honcho</a> plugin is the most sophisticated user-modeling backend, slotting in as the single allowed external memory provider (<code class="cite">plugins/memory/honcho/__init__.py:1</code>). Where <code>USER.md</code> is a bounded local file, Honcho maintains an AI-native, server-side representation of each peer and reasons over it dialectically. It runs in one of three recall modes — <code>context</code> (auto-inject only), <code>tools</code> (model queries explicitly), or <code>hybrid</code> (<code class="cite">plugins/memory/honcho/__init__.py:478</code>).</p>
+<h3>Five tools, two layers of recall</h3>
+<p>The plugin exposes <code>honcho_profile</code> (read/write a peer card), <code>honcho_search</code> (semantic excerpts, no synthesis), <code>honcho_reasoning</code> (synthesized dialectic answer at a chosen depth), <code>honcho_context</code> (raw session snapshot), and <code>honcho_conclude</code> (persist or delete a conclusion) (<code class="cite">plugins/memory/honcho/__init__.py:34</code>). Recall assembles two layers each turn: a cached base context (user representation + peer card, refreshed on a configurable cadence) and a dialectic supplement produced by the reasoning engine (<code class="cite">plugins/memory/honcho/__init__.py:506</code>).</p>
+<h3>The dialectic itself</h3>
+<p>"Dialectic" here is literal: <code>_run_dialectic_depth</code> runs up to three conditional <code>.chat()</code> passes against the user's representation (<code class="cite">plugins/memory/honcho/__init__.py:769</code>). Pass 0 is a cold-start or session-scoped query ("Who is this person?"); pass 1 is a self-audit that hunts for gaps in pass 0; pass 2 is a reconciliation pass that resolves contradictions between the prior two into a final synthesis (<code class="cite">plugins/memory/honcho/__init__.py:710</code>). A signal-sufficiency heuristic bails early when a pass already returned a structured, substantive answer, capping cost (<code class="cite">plugins/memory/honcho/__init__.py:749</code>).</p>
+<h3>How it closes the loop</h3>
+<p>Completed turns are recorded into Honcho on a background thread, chunked to fit the API's message limit, and writes to the built-in <code>USER.md</code> are mirrored as Honcho conclusions so the two stores stay consistent (<code class="cite">plugins/memory/honcho/__init__.py:860</code>, <code class="cite">plugins/memory/honcho/__init__.py:891</code>). On the next session the base context and a pre-warmed dialectic query ("What should I know about this user?") are fetched at init, so the model arrives with a synthesized profile already in context (<code class="cite">plugins/memory/honcho/__init__.py:394</code>). Notably, Honcho is fully disabled in cron and subagent contexts to avoid corrupting the user representation with non-conversational system prompts (<code class="cite">plugins/memory/honcho/__init__.py:272</code>).</p>
+<div class="callout warn"><strong>Dependency and cost caveat.</strong> Honcho is an optional, separately configured plugin (API key or self-hosted base URL) and is inactive unless installed and enabled (<code class="cite">plugins/memory/honcho/__init__.py:228</code>). Its dialectic passes are real LLM calls with real cost; the cadence, depth, and reasoning-level caps exist precisely to bound that spend. The closed loop it provides is strongest where it is configured — out of the box, the built-in memory loop is what runs.</div>
+</section>
+
+<section id="loop-diagram">
+<h2>The full learning loop</h2>
+<p>The diagram traces one turn through the loop. The user's message is answered using context assembled from the frozen memory snapshot, the skill index, and recalled state. After the answer is delivered, nudge counters may spawn the background review fork, which writes durable artifacts. Those artifacts re-enter the system prompt at the start of the next session.</p>
+<pre class="mermaid">graph TD;
+  U[User message] --&gt; CTX[Assemble context];
+  SNAP[Frozen MEMORY.md + USER.md snapshot] --&gt; CTX;
+  IDX[Skill index in system prompt] --&gt; CTX;
+  CTX --&gt; LOOP[Primary agent loop];
+  LOOP --&gt; SS[session_search: pull-based recall];
+  SS --&gt; LOOP;
+  LOOP --&gt; SP[skill_view loads a skill];
+  SP --&gt; PATCH[Skill defect? skill_manage patch];
+  PATCH --&gt; SKD[(~/.hermes/skills on disk)];
+  LOOP --&gt; ANS[Answer delivered to user];
+  ANS --&gt; NUDGE{Nudge counters crossed?};
+  NUDGE -- memory --&gt; FORK[Background review fork];
+  NUDGE -- skills --&gt; FORK;
+  FORK --&gt; MEMW[(MEMORY.md / USER.md)];
+  FORK --&gt; SKD;
+  COMP[Compression / exit] --&gt; FLUSH[flush_memories one-turn save];
+  FLUSH --&gt; MEMW;
+  ANS --&gt; HON[Honcho sync_turn background];
+  HON --&gt; HREP[(Honcho representation)];
+  MEMW --&gt; SNAP;
+  SKD --&gt; IDX;
+  HREP --&gt; CTX;</pre>
+</section>
+
+<section id="honest-ledger">
+<h2>Honest ledger: real loop vs aspiration</h2>
+<p>Not every mechanism on this page closes the loop to the same degree. The table below states, per mechanism, whether the persisted output re-enters a future prompt automatically (a real closed loop), whether it assists a human-driven loop, or whether it remains aspirational.</p>
+<table class="grid">
+<thead><tr><th>Mechanism</th><th>Trigger</th><th>Closes automatically?</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Curated memory + nudge</td><td>Turn counter (default 10)</td><td><span class="badge yes">Yes</span></td><td>Write to disk durable immediately; re-injected as frozen snapshot next session (<code class="cite">run_agent.py:8308</code>).</td></tr>
+<tr><td>Pre-compression flush</td><td>Compression / reset / exit</td><td><span class="badge yes">Yes</span></td><td>One-turn save salvages soon-to-be-lost context into durable memory (<code class="cite">run_agent.py:6972</code>).</td></tr>
+<tr><td>Autonomous skill creation</td><td>Tool-iteration counter</td><td><span class="badge yes">Yes</span></td><td>Background fork writes skill; appears in next session's skill index (<code class="cite">run_agent.py:11252</code>). Security-scanned (<code class="cite">tools/skill_manager_tool.py:56</code>).</td></tr>
+<tr><td>Skills self-improving in use</td><td>Defect found while skill is loaded</td><td><span class="badge yes">Yes</span></td><td>Tightest loop: patch the same file mid-task; next load reads the fix (<code class="cite">agent/prompt_builder.py:789</code>).</td></tr>
+<tr><td>FTS5 session recall</td><td>Model elects to search</td><td><span class="badge partial">Partial</span></td><td>Genuine cross-session recall, but pull-based — closes only when the model queries (<code class="cite">tools/session_search_tool.py:511</code>).</td></tr>
+<tr><td>SOUL.md identity</td><td>User edits the file</td><td><span class="badge partial">Partial</span></td><td>Feeds every future prompt, but human-authored, not auto-learned (<code class="cite">agent/prompt_builder.py:893</code>).</td></tr>
+<tr><td>Insights engine</td><td><code>/insights</code> command</td><td><span class="badge no">No</span></td><td>Reporting layer — informs the human, not written back into the prompt (<code class="cite">agent/insights.py:1</code>).</td></tr>
+<tr><td>Honcho dialectic modeling</td><td>Per-turn sync + cadence-gated recall</td><td><span class="badge yes">Yes</span> <span class="badge unsupported">when configured</span></td><td>Strong closed loop, but an optional external plugin with its own cost and credentials (<code class="cite">plugins/memory/honcho/__init__.py:228</code>).</td></tr>
+</tbody>
+</table>
+<div class="callout key"><strong>The real closed loop, stated plainly.</strong> Four mechanisms close the loop with no human required: curated-memory nudges, the pre-compression flush, autonomous skill creation, and in-use skill self-improvement. All four share the same backbone — a turn/iteration counter or a compression event triggers a write to a durable on-disk artifact, which is read back into a later prompt as either the frozen memory snapshot or the skill index. Session search and SOUL.md are real and valuable but human- or model-initiated; the insights engine is reporting, not adaptation. Honcho is a genuine closed loop when you choose to wire it in.</div>
+<p>The aspirational edge is honesty about <em>quality</em>, not existence. The loops described here move artifacts mechanically and reliably; whether the agent's <em>judgment</em> about what to remember, what to skillify, and how to patch a skill improves over time depends on the underlying model's discrimination, not on any guarantee in the harness. Hermes builds the closed circuit; the model decides what to send around it.</p>
+</section>
+    </main>
+  </div>
+  <footer>
+    Hermes Agent engineering wiki · generated from a source-grounded multi-agent analysis of
+    <code>IgorTavcar/hermes-agent</code> (fork of <code>NousResearch/hermes-agent</code>).
+    Citations are <code>path:line</code> into the repo at analysis time. Diagrams render with
+    mermaid.js (needs network); otherwise they appear as text.
+  </footer>
+  <script>
+    // scrollspy: highlight the current section in the sidebar
+    const links = [...document.querySelectorAll('.sidebar a')];
+    const map = new Map(links.map(a => [a.getAttribute('href').slice(1), a]));
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          links.forEach(a => a.classList.remove('active'));
+          const a = map.get(e.target.id);
+          if (a) a.classList.add('active');
+        }
+      });
+    }, { rootMargin: '-80px 0px -70% 0px' });
+    document.querySelectorAll('main section[id]').forEach(s => obs.observe(s));
+  </script>
+</body>
+</html>

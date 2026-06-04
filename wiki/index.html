@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hermes Agent — Engineering Wiki · Hermes Wiki</title>
+  <link rel="stylesheet" href="./style.css">
+  <script src="./vendor/mermaid.min.js"></script>
+  <script>
+    // Local vendored mermaid → renders from file:// offline, no CDN, no missed load-event.
+    window.addEventListener("DOMContentLoaded", function () {
+      if (!window.mermaid) return;
+      try {
+        mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "loose",
+          themeVariables: { fontFamily: "ui-monospace, monospace", fontSize: "13px",
+            primaryColor: "#171b24", primaryBorderColor: "#2d3543", primaryTextColor: "#e7ebf2",
+            lineColor: "#c9a93a", secondaryColor: "#12151c", tertiaryColor: "#0a0c10" } });
+        mermaid.run({ querySelector: "pre.mermaid" });
+      } catch (e) { console.error("mermaid render failed", e); }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="index.html"><span class="mark">☤</span> Hermes Agent <span class="sub">Engineering Wiki</span></a>
+    <nav>
+      <a href="index.html" class="active">Overview</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="self-improvement.html">Self-Improvement</a>
+      <a href="internals.html">Internals</a>
+      <a href="providers-auth.html">Providers &amp; Auth</a>
+      <a href="faq.html">FAQ</a>
+    </nav>
+  </header>
+  <div class="layout">
+    <aside class="sidebar">
+      <p class="toc-title">On this page</p>
+      <ul>
+        <li><a href="#what-hermes-is">What Hermes is</a></li>
+        <li><a href="#whats-in-this-wiki">What&#x27;s in this wiki</a></li>
+        <li><a href="#highlights">Highlights at a glance</a></li>
+        <li><a href="#reading-map">How to read the codebase</a></li>
+      </ul>
+    </aside>
+    <main>
+<h1 class="page-title">Hermes Agent — Engineering Wiki</h1>
+<p class="lead">Hermes Agent is a self-improving, multi-platform AI agent harness from Nous Research (MIT-licensed) that drives a single user message to completion through a provider-agnostic turn loop, calls real tools over an RPC stub so a fifty-step pipeline costs one inference turn, and runs against roughly two dozen inference providers — including subscription-OAuth backends like ChatGPT Plus and Claude Pro/Max — while clinging to the two things that actually matter in production: the model's context window and its hourly rate quota.</p>
+
+<section id="what-hermes-is">
+<h2>What Hermes is</h2>
+<p>Hermes is the agent runtime that wraps a chat model in everything it needs to act in the world: a terminal, a filesystem, web search, code execution, memory, and a gateway onto messaging platforms. It is provider-agnostic by design. The same production turn loop, <code>AIAgent.run_conversation()</code> at <code class="cite">run_agent.py:8169</code>, is used identically by the CLI and the gateway, and it speaks to every backend through the OpenAI ChatCompletion spec plus an Anthropic Messages transport, with adapters for Codex Responses and Bedrock Converse. Provider differences are quarantined inside <code>_build_api_kwargs</code> and per-provider adapter modules so the loop body stays uniform.</p>
+
+<p>That loop is deliberately simple at its core — a synchronous, single-threaded <code>while (api_call_count &lt; max_iterations and iteration_budget.remaining &gt; 0)</code> at <code class="cite">run_agent.py:8531</code> — and deliberately paranoid at its edges. Each iteration assembles per-call <code>api_messages</code> (an ephemeral system prompt plus memory and plugin injections plus KV-cache breakpoints), calls the model through a streaming-first interruptible transport, normalizes whatever the provider returns into a uniform OpenAI-style <code>SimpleNamespace</code>, and branches on tool-calls-versus-text. Tool calls dispatch through <code>_execute_tool_calls()</code> at <code class="cite">run_agent.py:7235</code>, which runs them on a concurrent <code>ThreadPoolExecutor</code> (up to 8 workers) or sequentially, appends <code>role:"tool"</code> results, and continues; a plain text response with no tool calls becomes the <code>final_response</code> and breaks.</p>
+
+<div class="callout key"><strong>Key insight.</strong> There are genuinely two loop implementations, and they are asymmetric. The production sync <code>run_conversation</code> is shared verbatim by CLI and gateway; the only truly distinct second loop is the async <code>HermesAgentLoop.run()</code> at <code class="cite">environments/agent_loop.py:175</code>, used solely by RL and eval environments against a pluggable <code>server</code> — and it even carries a raw <code>&lt;tool_call&gt;</code>-tag fallback parser (<code class="cite">environments/agent_loop.py:268</code>) for servers whose structured tool-calling can't keep up.</div>
+
+<p>"Self-improving" is not a slogan here. Hermes closes a learning loop: trajectories are compressed and fed back, routines run on cron, and an auxiliary guardian LLM sits inside the approval gate to triage approve/deny/escalate before a human is ever bothered (<code class="cite">tools/approval.py:766</code>), an idea borrowed from OpenAI Codex's Smart Approvals.</p>
+</section>
+
+<section id="whats-in-this-wiki">
+<h2>What's in this wiki</h2>
+<p>This wiki is organized into focused reference pages. Start wherever your question lives:</p>
+
+<dl class="spec">
+<dt><a href="architecture.html">Architecture</a></dt>
+<dd>The production turn loop end to end — message assembly, the streaming-first transport, response normalization into a uniform <code>SimpleNamespace</code>, tool dispatch via <code>_execute_tool_calls()</code>, the concurrent-versus-sequential paths with path-overlap checks, and how the two loops (sync <code>run_conversation</code> vs. async <code>HermesAgentLoop</code>) differ.</dd>
+
+<dt><a href="self-improvement.html">Self-Improvement</a></dt>
+<dd>The closed learning loop: trajectory compression, cron-scheduled routines, the iteration/budget model (including the refund for programmatic turns), and the auxiliary-LLM guardian inside the approval gate.</dd>
+
+<dt><a href="internals.html">Internals</a></dt>
+<dd>The clever bits: Programmatic Tool Calling (<code>execute_code</code>) over an RPC stub, the structured context compactor with content-hash dedup and tool-pair repair, serverless filesystem-snapshot persistence on Modal/Daytona, and the stateful-remote-shell trick.</dd>
+
+<dt><a href="providers-auth.html">Providers &amp; Auth</a></dt>
+<dd>The <code>PROVIDER_REGISTRY</code> of ~24 providers, the five <code>auth_type</code> values, subscription-OAuth flows (Nous device code, Codex/ChatGPT PKCE, GitHub Copilot, Claude Pro/Max), the cross-process credential pool, and the on-disk auth store.</dd>
+
+<dt><a href="faq.html">FAQ</a></dt>
+<dd>Quick answers to the questions that recur: which providers need a subscription, why streaming is always on, what the context compactor throws away, and how serverless persistence actually works.</dd>
+</dl>
+</section>
+
+<section id="highlights">
+<h2>Highlights at a glance</h2>
+<p>The recurring theme across Hermes is that the non-obvious win is almost always about protecting the LLM's context window, surviving real-world rate limits, or making stateless cloud backends behave like stateful shells.</p>
+
+<table class="grid">
+<thead><tr><th>Capability</th><th>What it does</th><th>Where</th></tr></thead>
+<tbody>
+<tr><td><strong>Closed learning loop</strong></td><td>Self-improving agent: trajectory compression feeds experience back, cron routines run unattended, and a guardian LLM gates approvals.</td><td><code class="cite">tools/approval.py:766</code></td></tr>
+<tr><td><strong>RPC zero-context tool calls</strong></td><td><code>execute_code</code>: the LLM writes a Python script that calls real Hermes tools over an RPC stub, so a 50-call pipeline costs one inference turn and intermediate outputs never enter context.</td><td>Internals</td></tr>
+<tr><td><strong>Six terminal backends</strong></td><td>Local plus serverless (Modal/Daytona) sandboxes that filesystem-snapshot on cleanup and restore next session to fake persistence on hibernating sandboxes.</td><td>Internals</td></tr>
+<tr><td><strong>Trajectory / context compression</strong></td><td>Dedups identical tool results by MD5 content hash, replaces old outputs with typed information-bearing one-liners (not dumb placeholders), and repairs orphaned tool_call/result pairs so the provider never 400s.</td><td><code class="cite">trajectory_compressor.py</code></td></tr>
+<tr><td><strong>Multi-platform gateway</strong></td><td>One agent fronts messaging platforms through the same shared <code>run_conversation</code> the CLI uses — no second code path.</td><td><code class="cite">run_agent.py:8169</code></td></tr>
+<tr><td><strong>Cron routines</strong></td><td>Scheduled, unattended agent runs that drive the self-improvement loop on a timer.</td><td>Self-Improvement</td></tr>
+<tr><td><strong>Broad provider support</strong></td><td>~24 providers across five auth types, including subscription-OAuth (ChatGPT Plus/Pro drives Codex; Claude Pro/Max drives Anthropic; GitHub Copilot device-code).</td><td><code class="cite">hermes_cli/auth.py:103</code></td></tr>
+</tbody>
+</table>
+
+<div class="callout surprise"><strong>Surprising by design.</strong> Streaming is preferred <em>always</em> — even when no display or TTS consumer is attached — purely to gain stale-connection and read-timeout health checks the non-streaming path lacks (<code class="cite">run_agent.py:8844</code>). The streamed response is then repackaged into a non-streaming-shaped <code>SimpleNamespace</code> so the loop body never notices.</div>
+
+<div class="callout info"><strong>Cache-friendly by construction.</strong> Tool-call JSON is re-serialized with <code>sort_keys</code> and tight separators on every API call (<code class="cite">run_agent.py:8696</code>) to keep the prompt prefix byte-identical across turns, preserving KV-cache reuse on local inference servers like llama.cpp, vLLM, and Ollama.</div>
+</section>
+
+<section id="reading-map">
+<h2>How to read the codebase</h2>
+<p>If you are reading Hermes for the first time, walk these files in order — they form a spine from the turn loop out to the providers.</p>
+
+<table class="grid">
+<thead><tr><th>File</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td><code class="cite">run_agent.py</code></td><td>The heart of the system (~11.5k lines). Production turn loop <code>run_conversation()</code> at <code class="cite">run_agent.py:8169</code>, the budget loop at <code class="cite">run_agent.py:8531</code>, tool dispatch at <code class="cite">run_agent.py:7235</code>, the path-overlap parallelism check at <code class="cite">run_agent.py:296</code>, and the five degenerate-response recovery strategies around <code class="cite">run_agent.py:10757</code>.</td></tr>
+<tr><td><code class="cite">environments/agent_loop.py</code></td><td>The async RL/eval loop <code>HermesAgentLoop.run()</code> at <code class="cite">environments/agent_loop.py:175</code>, including the raw tag-fallback parser at <code class="cite">environments/agent_loop.py:268</code>. Read this to understand how the two loops diverge.</td></tr>
+<tr><td><code class="cite">tools/approval.py</code></td><td>The approval gate and the embedded auxiliary-LLM guardian at <code class="cite">tools/approval.py:766</code>.</td></tr>
+<tr><td><code class="cite">trajectory_compressor.py</code></td><td>Context compaction: content-hash dedup, information-bearing one-liner replacement, and <code>_sanitize_tool_pairs</code> orphan repair.</td></tr>
+<tr><td><code class="cite">hermes_cli/auth.py</code></td><td>The <code>PROVIDER_REGISTRY</code> at <code class="cite">hermes_cli/auth.py:103</code>, the five <code>auth_type</code> values, the OAuth flows, and the on-disk auth store at <code class="cite">hermes_cli/auth.py:571</code>.</td></tr>
+</tbody>
+</table>
+
+<p>A bird's-eye view of how a single message flows through the system:</p>
+<pre class="mermaid">graph TD;
+  U[User message]--&gt;RC[run_conversation run_agent.py:8169];
+  RC--&gt;L{budget loop 8531};
+  L--&gt;A[assemble api_messages + cache breakpoints];
+  A--&gt;T[streaming-first transport];
+  T--&gt;N[normalize to SimpleNamespace];
+  N--&gt;B{tool calls?};
+  B--&gt;|yes|D[_execute_tool_calls 7235];
+  D--&gt;L;
+  B--&gt;|no|F[final_response break];
+  D--&gt;EC[execute_code RPC stub];
+  EC--&gt;CP[context compactor];</pre>
+
+<div class="callout warn"><strong>Caveat.</strong> Subscription-OAuth providers route real consumer subscriptions through agent traffic (e.g. Claude Pro/Max via Bearer auth with Claude-Code identity, ChatGPT Plus driving Codex). Confirm such usage is within each provider's terms of service before relying on it in production; Hermes provides the transport, not the entitlement.</div>
+</section>
+    </main>
+  </div>
+  <footer>
+    Hermes Agent engineering wiki · generated from a source-grounded multi-agent analysis of
+    <code>IgorTavcar/hermes-agent</code> (fork of <code>NousResearch/hermes-agent</code>).
+    Citations are <code>path:line</code> into the repo at analysis time. Diagrams render with
+    mermaid.js (needs network); otherwise they appear as text.
+  </footer>
+  <script>
+    // scrollspy: highlight the current section in the sidebar
+    const links = [...document.querySelectorAll('.sidebar a')];
+    const map = new Map(links.map(a => [a.getAttribute('href').slice(1), a]));
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          links.forEach(a => a.classList.remove('active'));
+          const a = map.get(e.target.id);
+          if (a) a.classList.add('active');
+        }
+      });
+    }, { rootMargin: '-80px 0px -70% 0px' });
+    document.querySelectorAll('main section[id]').forEach(s => obs.observe(s));
+  </script>
+</body>
+</html>

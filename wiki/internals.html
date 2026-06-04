@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Surprising Internals: Fresh Engineering in Hermes · Hermes Wiki</title>
+  <link rel="stylesheet" href="./style.css">
+  <script src="./vendor/mermaid.min.js"></script>
+  <script>
+    // Local vendored mermaid → renders from file:// offline, no CDN, no missed load-event.
+    window.addEventListener("DOMContentLoaded", function () {
+      if (!window.mermaid) return;
+      try {
+        mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "loose",
+          themeVariables: { fontFamily: "ui-monospace, monospace", fontSize: "13px",
+            primaryColor: "#171b24", primaryBorderColor: "#2d3543", primaryTextColor: "#e7ebf2",
+            lineColor: "#c9a93a", secondaryColor: "#12151c", tertiaryColor: "#0a0c10" } });
+        mermaid.run({ querySelector: "pre.mermaid" });
+      } catch (e) { console.error("mermaid render failed", e); }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="index.html"><span class="mark">☤</span> Hermes Agent <span class="sub">Engineering Wiki</span></a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="self-improvement.html">Self-Improvement</a>
+      <a href="internals.html" class="active">Internals</a>
+      <a href="providers-auth.html">Providers &amp; Auth</a>
+      <a href="faq.html">FAQ</a>
+    </nav>
+  </header>
+  <div class="layout">
+    <aside class="sidebar">
+      <p class="toc-title">On this page</p>
+      <ul>
+        <li><a href="#ptc">Programmatic Tool Calling</a></li>
+        <li><a href="#sandbox">Sandbox Security &amp; Output Capping</a></li>
+        <li><a href="#compaction">Live Context Compaction</a></li>
+        <li><a href="#credentials">Credential Pool</a></li>
+        <li><a href="#ratelimits">Rate-Limit Handling</a></li>
+        <li><a href="#backends">Terminal Backends &amp; Serverless Hibernation</a></li>
+        <li><a href="#caching">Anthropic Prompt Caching</a></li>
+        <li><a href="#routing">Smart Model Routing &amp; Fingerprinting</a></li>
+        <li><a href="#extensibility">Hooks, ACP &amp; Toolset Resolution</a></li>
+      </ul>
+    </aside>
+    <main>
+<h1 class="page-title">Surprising Internals: Fresh Engineering in Hermes</h1>
+<p class="lead">Hermes Agent is full of &ldquo;huh, that&rsquo;s clever&rdquo; engineering where the non-obvious win is almost always one of three things: protecting the LLM&rsquo;s context window, surviving real-world rate limits, or making stateless cloud backends behave like stateful shells. This page walks the standouts &mdash; what the mechanism is, and <em>why</em> it&rsquo;s a genuinely good idea &mdash; starting with the headline feature, Programmatic Tool Calling, and working out through context compaction, credential rotation, six terminal backends, prompt caching, and the extensibility surface.</p>
+
+<section id="ptc">
+<h2>Programmatic Tool Calling: collapse N tool calls into one zero-context turn</h2>
+<p>The headline win. Instead of the model making ten separate tool calls &mdash; each round-tripping its full result back into the context window &mdash; the LLM writes a single Python script. That script imports an <strong>auto-generated</strong> <code>hermes_tools.py</code> stub module and calls real Hermes tools (<code>web_search</code>, <code>read_file</code>, <code>terminal</code>, <code>patch</code>, &hellip;) as ordinary Python functions. The agent spends <strong>one</strong> inference turn; the script may make up to 50 tool calls internally, and <strong>only the script&rsquo;s stdout returns to the model</strong> &mdash; intermediate tool results never enter the context window <code class="cite">tools/code_execution_tool.py:24-26</code>.</p>
+
+<div class="callout surprise"><strong>Surprise.</strong> The entire purpose of <code>execute_code</code> is that intermediate tool outputs <em>never</em> touch the LLM&rsquo;s attention. A 50-call pipeline &mdash; search, fetch, parse, filter, reduce, loop &mdash; costs exactly one inference turn, because the filtering and looping happen in Python <em>outside</em> the context window. This is &ldquo;programmatic tool calling&rdquo; done right.</div>
+
+<h3>One stub API, two interchangeable transports</h3>
+<p>What makes this engineering-interesting rather than merely a sandbox is that the same generated stub API runs over two completely different transports, chosen by whether the terminal backend is local or remote <code class="cite">tools/code_execution_tool.py:8-26</code>.</p>
+<table class="grid">
+<thead><tr><th>Transport</th><th>Mechanism</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Local (UDS)</td><td>Parent opens an <code>AF_UNIX</code> socket, spawns the child, and runs an RPC listener thread. The stub&rsquo;s <code>_call()</code> sends newline-delimited JSON over the socket and blocks for the reply <code class="cite">tools/code_execution_tool.py:207-242</code>; server loop at <code class="cite">tools/code_execution_tool.py:307-413</code>.</td><td>Fast, in-process dispatch for the common case.</td></tr>
+<tr><td>Remote (file-RPC)</td><td>For Docker/SSH/Modal/Daytona the stub writes <code>req_NNNNNN</code> files atomically (write <code>.tmp</code>, then <code>os.rename</code>) and polls for <code>res_NNNNNN</code>, with adaptive backoff 50ms&rarr;250ms <code class="cite">tools/code_execution_tool.py:256-294</code>. A parent-side thread <code>ls</code>-es the remote RPC dir via <code>env.execute()</code> and dispatches through the <em>same</em> <code>handle_function_call</code> <code class="cite">tools/code_execution_tool.py:564-696</code>.</td><td>No socket reaches into a sandbox; atomic file rename is the lowest-common-denominator IPC.</td></tr>
+</tbody>
+</table>
+<p>The remote path carries two battle-scar details. Responses are written <strong>base64-encoded</strong> specifically because &ldquo;Modal doesn&rsquo;t reliably deliver stdin to chained commands&rdquo; <code class="cite">tools/code_execution_tool.py:564-696</code>. And on macOS the local socket is forced into <code>/tmp</code> because <code>/var/folders/&hellip;</code> paths blow past the 104-byte <code>AF_UNIX</code> path limit <code class="cite">tools/code_execution_tool.py:955-959</code> &mdash; the kind of bug you only fix after hitting it.</p>
+
+<pre class="mermaid">graph TD
+  LLM["LLM: one inference turn"] --&gt;|writes script| EC["execute_code"]
+  EC --&gt;|local backend| UDS["UDS RPC listener thread"]
+  EC --&gt;|remote backend| FRPC["file-RPC poll thread"]
+  EC --&gt;|spawn| CHILD["child python (credential-stripped env)"]
+  CHILD --&gt;|import| STUB["hermes_tools.py stubs"]
+  STUB --&gt;|_call JSON| UDS
+  STUB --&gt;|req_NNNNNN files| FRPC
+  UDS --&gt;|dispatch| HFC["handle_function_call"]
+  FRPC --&gt;|dispatch| HFC
+  HFC --&gt; TOOLS["real tools: web_search / terminal / patch ..."]
+  TOOLS --&gt;|result| HFC
+  HFC --&gt;|reply| STUB
+  CHILD --&gt;|stdout only, head+tail 50KB| EC
+  EC --&gt;|"only stdout returns"| LLM</pre>
+
+<h3>The schema is prompt engineering too</h3>
+<p>The tool&rsquo;s schema text is itself a small piece of prompt engineering. It tells the model exactly when to reach for this tool &mdash; &ldquo;3+ tool calls with processing logic&rdquo;, &ldquo;filter/reduce large tool outputs before they enter your context&rdquo;, branching, looping &mdash; and when <em>not</em> to (single call, needs the full result, interactive) <code class="cite">tools/code_execution_tool.py:1357-1376</code>. The generated stub even ships convenience helpers baked in &mdash; <code>json_parse</code> with <code>strict=False</code>, <code>shell_quote</code>, and a <code>retry</code> with exponential backoff &mdash; so LLM-authored scripts avoid the usual pitfalls <code class="cite">tools/code_execution_tool.py:84-162</code>.</p>
+<div class="callout info"><strong>Quiet correctness detail.</strong> Dispatched tool handlers have their stdout/stderr redirected to <code>/dev/null</code> during the RPC call, so a tool&rsquo;s internal status prints don&rsquo;t corrupt the CLI spinner <code class="cite">tools/code_execution_tool.py:307-413</code>.</div>
+</section>
+
+<section id="sandbox">
+<h2>Sandbox security: credential-stripped child env + head/tail output cap</h2>
+<p>The child process running LLM-authored code gets a <strong>deliberately minimal environment</strong>. The constructor walks <code>os.environ</code> and applies three rules: (1) always pass skill-declared passthrough vars, (2) <strong>drop anything whose name contains</strong> <code>KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|PASSWD|AUTH</code>, and (3) only allow known-safe prefixes (<code>PATH</code>, <code>HOME</code>, <code>LANG</code>, <code>HERMES_</code>, &hellip;) <code class="cite">tools/code_execution_tool.py:994-1021</code>.</p>
+
+<div class="callout surprise"><strong>Surprise.</strong> The script can <em>call</em> <code>web_search</code> and <code>terminal</code>, but it can never <em>see</em> the API keys that power them. The rationale is explicit in the code: &ldquo;prevent credential exfiltration from LLM-generated scripts. The child accesses tools via RPC, not direct API.&rdquo; The parent holds the keys and dispatches on the child&rsquo;s behalf, so capability and credential are cleanly separated <code class="cite">tools/code_execution_tool.py:994-1021</code>.</div>
+
+<p>The env is otherwise hand-curated: it injects only <code>TZ</code> (popping the internal <code>HERMES_TIMEZONE</code>) and can redirect <code>HOME</code> for per-profile isolation <code class="cite">tools/code_execution_tool.py:1029-1043</code>.</p>
+
+<h3>A 50KB cap that protects the answer</h3>
+<p>The stdout cap is not a naive head-only truncation. It splits the 50KB budget <strong>head+tail</strong>: 40% keeps the <em>start</em>, and 60% keeps a rolling <code>deque</code> of the <em>end</em> <code class="cite">tools/code_execution_tool.py:1063-1089</code>.</p>
+<div class="callout key"><strong>Key insight.</strong> A script&rsquo;s final <code>print()</code> &mdash; usually the actual answer &mdash; lives at the <em>end</em> of stdout. A head-only cap would discard precisely the thing the model needs when a noisy middle blows the budget. The 40/60 head+tail split guarantees the answer survives. Stderr, where errors appear early, stays head-only.</div>
+</section>
+
+<section id="compaction">
+<h2>Live context compaction: hash dedup, informative summaries, tool-pair repair</h2>
+<p><code>ContextCompressor</code> is far smarter than the typical &ldquo;summarize the middle&rdquo; compactor. Before any LLM call, <code>_prune_old_tool_results</code> runs three cheap, structural passes that cost no inference at all <code class="cite">agent/context_compressor.py:405-466</code>.</p>
+
+<h3>Pass 1 &mdash; content-hash dedup</h3>
+<p>Walking backward, it MD5-hashes each tool result over 200 chars. The first (newest) occurrence is kept in full; <strong>older identical results are replaced with a back-reference</strong>, <code>[Duplicate tool output &mdash; same content as a more recent call]</code> <code class="cite">agent/context_compressor.py:405-466</code>.</p>
+<div class="callout surprise"><strong>Surprise.</strong> Reading the same file five times used to cost five full copies in context. After dedup it costs one full copy plus four one-line back-references &mdash; identified purely by content hash, so it catches duplicates even when the tool calls look different.</div>
+
+<h3>Pass 2 &mdash; information-bearing summaries, not placeholders</h3>
+<p>Old tool outputs become a typed one-liner that <em>carries information</em>, for example <code>[terminal] ran `npm test` -&gt; exit 0, 47 lines output</code> or <code>[search_files] content search for 'compress' in agent/ -&gt; 12 matches</code>. <code>_summarize_tool_result</code> has bespoke formatting for roughly 20 tool types and even regex-extracts the exit code or match count out of the raw result <code class="cite">agent/context_compressor.py:66-185</code>. The author explicitly contrasts this with &ldquo;a generic placeholder that carries zero information.&rdquo;</p>
+
+<h3>Pass 3 &mdash; argument truncation</h3>
+<p>A <code>write_file</code> with 50KB of content in its tool_call arguments would otherwise survive compression untouched, so large args outside the protected tail are clipped to ~200 chars <code class="cite">agent/context_compressor.py:405-466</code>.</p>
+
+<h3>The correctness gem: repairing orphaned tool pairs</h3>
+<p>After summarization you can end up with a <code>tool</code> result whose assistant <code>tool_call</code> was deleted, or vice-versa &mdash; both of which make the OpenAI/Anthropic API hard-reject the request (&ldquo;No tool call found for function call output&rdquo;). <code>_sanitize_tool_pairs</code> removes orphaned results <strong>and</strong> injects stub results for orphaned calls, so the message list is always well-formed <code class="cite">agent/context_compressor.py:778-836</code>.</p>
+<div class="callout surprise"><strong>Surprise.</strong> This is the subtle landmine most compactors miss: pruning messages can split a <code>tool_call</code>/<code>tool_result</code> pair, and the provider API will then 400 the entire request. Hermes repairs the pairing in both directions rather than just hoping the boundaries line up.</div>
+
+<p>The summary itself is a structured <strong>checkpoint template</strong> (Active Task / Goal / Completed Actions / Active State / Blocked / Resolved vs Pending), framed for &ldquo;a DIFFERENT assistant that continues the conversation&rdquo; and told <em>not</em> to answer any questions in the transcript &mdash; a deliberate borrow from OpenCode/Codex framing <code class="cite">agent/context_compressor.py:577-635</code>. The summary budget scales with content size and model context (20% of compressed tokens, floored at 2000, capped at min(5% of context, 12000)) rather than a dead fixed cap <code class="cite">agent/context_compressor.py:474-483</code>.</p>
+</section>
+
+<section id="credentials">
+<h2>Credential pool: OAuth refresh, soft leases, status-aware cooldowns</h2>
+<p><code>CredentialPool</code> is a production-grade multi-key rotator, not a round-robin list. Four details stand out.</p>
+
+<h3>Status-aware cooldown TTLs</h3>
+<p>A 429 (rate-limited) cools a key down for <strong>1 hour</strong>; other exhaustion uses a default TTL <code class="cite">agent/credential_pool.py:192-196</code>. Better still, it tries to compute an <em>exact</em> reset time from the provider: <code>_normalize_error_context</code> parses <code>reset_at</code>/<code>resets_at</code>/<code>retry_until</code>, and if those are absent, regex-extracts a <code>retry after N seconds</code> or <code>quotaResetDelay</code> from the error body, preferring that precise timestamp over the coarse TTL <code class="cite">agent/credential_pool.py:229-275</code>.</p>
+
+<h3>Cross-process token sync</h3>
+<p>For Anthropic <code>claude_code</code> and OpenAI Codex entries, before declaring a key exhausted it <strong>re-reads the on-disk credentials file</strong> &mdash; picking up tokens that the Claude Code CLI or another Hermes profile refreshed in a separate process <code class="cite">agent/credential_pool.py:784-802</code>.</p>
+<div class="callout surprise"><strong>Surprise.</strong> The pool shares OAuth tokens across processes by re-reading the credentials file at the last moment. So if the Claude Code CLI silently refreshed a token a minute ago, Hermes picks it up instead of marking a perfectly good key as dead. That&rsquo;s the kind of safeguard you only add after getting burned by a stale token.</div>
+
+<h3>Soft leases for concurrency</h3>
+<p><code>acquire_lease</code> picks the <em>least-leased</em> available credential (priority as tie-break) and, when every key is at the soft concurrency cap, still returns the least-loaded one instead of blocking <code class="cite">agent/credential_pool.py:890-919</code>. This spreads concurrent gateway sessions across keys without a hard semaphore. Selection strategy is pluggable &mdash; random, least-used, or round-robin, with round-robin re-ordering and persisting the entry list <code class="cite">agent/credential_pool.py:837-858</code>.</p>
+</section>
+
+<section id="ratelimits">
+<h2>Rate-limit handling: killing retry amplification + jittered backoff</h2>
+<p>Two small files punch well above their weight. <code>nous_rate_guard.py</code> records a <strong>shared, atomically-written</strong> rate-limit state file so <em>every</em> session (CLI, gateway, cron, auxiliary) checks it before issuing a request.</p>
+<div class="callout surprise"><strong>Surprise.</strong> The comment quantifies the exact bug it kills: &ldquo;Each 429 from Nous triggers up to <strong>9 API calls</strong> per conversation turn (3 SDK retries x 3 Hermes retries), and every one counts against RPH&rdquo; <code class="cite">agent/nous_rate_guard.py:1-11</code>. Recording the limit on the <em>first</em> 429 and short-circuiting the rest collapses a 9&times; amplification down to 1.</div>
+<p>It parses the reset time in a clear priority order &mdash; hourly RPH header &rarr; per-minute RPM header &rarr; generic <code>retry-after</code> &mdash; and writes the state file via <code>mkstemp</code> + <code>os.replace</code> for atomicity <code class="cite">agent/nous_rate_guard.py:38-67</code>.</p>
+<p><code>retry_utils.jittered_backoff</code> then replaces fixed exponential backoff with <strong>decorrelated jitter</strong> so multiple sessions hitting the same provider don&rsquo;t all retry on the same tick. It seeds the RNG from <code>time_ns() ^ (counter * 0x9E3779B9)</code> &mdash; the golden-ratio constant &mdash; behind a lock, so even a coarse clock produces distinct jitter per call <code class="cite">agent/retry_utils.py:41-57</code>. The companion <code>rate_limit_tracker.py</code> parses the full 12-header <code>x-ratelimit-*</code> schema into RPM/RPH/TPM/TPH buckets, with elapsed-time-adjusted <code>remaining_seconds_now</code> powering the <code>/usage</code> command <code class="cite">agent/rate_limit_tracker.py:8-21</code>.</p>
+</section>
+
+<section id="backends">
+<h2>Six terminal backends + serverless hibernation</h2>
+<p><code>BaseEnvironment</code> abstracts six backends &mdash; local, Docker, Singularity, SSH, Modal, Daytona &mdash; behind one <code>execute()</code>. The non-obvious cleverness is how it fakes a <strong>persistent login shell on top of spawn-per-call</strong> remote sandboxes.</p>
+
+<h3>Faking a stateful shell</h3>
+<dl class="spec">
+<dt>Session snapshot</dt><dd>Once at init it captures the login shell&rsquo;s exported vars, functions, and aliases into a sourced file: <code>export -p &gt; snap; declare -f &gt;&gt; snap; alias -p &gt;&gt; snap</code> <code class="cite">tools/environments/base.py:315-336</code>. Every later command sources that snapshot, then <strong>re-dumps env vars back into it</strong> (last-writer-wins), so an <code>export FOO=bar</code> in one call is visible in the next <code class="cite">tools/environments/base.py:363-390</code>.</dd>
+<dt>CWD via stdout markers</dt><dd>Since each remote command is a fresh process, CWD can&rsquo;t persist naturally. <code>_wrap_command</code> appends <code>printf '\nMARKER%sMARKER\n' "$(pwd -P)"</code>; the parent parses the marker out of stdout to track the working directory across calls <code class="cite">tools/environments/base.py:363-390</code>.</dd>
+</dl>
+<div class="callout surprise"><strong>Surprise.</strong> Remote shells where each command is a brand-new process are made to behave like one persistent login shell &mdash; using a sourced env/function/alias snapshot plus in-band CWD markers smuggled through stdout. No daemon, no persistent connection required.</div>
+
+<h3>Serverless hibernation: snapshot on cleanup, restore next session</h3>
+<p>Cloud sandboxes auto-stop, so persistence is implemented as snapshot/restore rather than a long-lived box.</p>
+<table class="grid">
+<thead><tr><th>Backend</th><th>Persistence mechanism</th></tr></thead>
+<tbody>
+<tr><td>Modal</td><td>On <code>cleanup()</code> it calls <code>sandbox.snapshot_filesystem()</code>, stores the resulting image <code>object_id</code> keyed by <code>task_id</code> in a JSON store, then terminates; the next session restores from that snapshot id (with a legacy key-namespace migration) <code class="cite">tools/environments/modal.py:402-433</code>.</td></tr>
+<tr><td>Daytona</td><td>Persistent sandboxes are <code>stop()</code>-ed (not deleted) on cleanup and <code>start()</code>-ed/resumed by name on the next creation, preserving the filesystem; <code>auto_stop_interval=0</code> disables platform auto-stop so Hermes controls the lifecycle <code class="cite">tools/environments/daytona.py:81-118</code>.</td></tr>
+</tbody>
+</table>
+<div class="callout surprise"><strong>Surprise.</strong> Filesystem persistence is faked on hibernating serverless sandboxes: snapshot the FS on cleanup, store the snapshot id against the task, and restore from it next time. The box dies between sessions; the work survives.</div>
+
+<h3>Transactional file sync</h3>
+<p>Underpinning the file-sync backends (SSH/Modal/Daytona) is <code>FileSyncManager</code>: mtime+size change detection, deletion tracking, 5s rate-limiting, and <strong>transactional commit with rollback</strong> &mdash; state is updated only if <em>all</em> uploads and deletes succeed, else it rolls back so the next cycle retries everything <code class="cite">tools/environments/file_sync.py:101-168</code>. Daytona&rsquo;s bulk upload batches roughly 580 files into one multipart POST, cutting sync from about 5min to under 2s <code class="cite">tools/environments/daytona.py:147-167</code>. Docker and Singularity skip all of this &mdash; they bind-mount the live host filesystem.</p>
+</section>
+
+<section id="caching">
+<h2>Anthropic prompt caching: a rolling-window of breakpoints</h2>
+<p>A compact, correct implementation of the highest-leverage Anthropic cost optimization. <code>apply_anthropic_cache_control</code> places the <strong>4 cache_control breakpoints</strong> (Anthropic&rsquo;s maximum) as the system prompt &mdash; stable across every turn &mdash; plus the <strong>last 3 non-system messages</strong> as a rolling window <code class="cite">agent/prompt_caching.py:41-71</code>.</p>
+<div class="callout key"><strong>Key insight.</strong> The rolling tail means each new turn re-uses the cached prefix up to the previous breakpoint, so a multi-turn conversation gets roughly 75% input-token savings without ever managing cache state by hand.</div>
+<p><code>_apply_cache_marker</code> carefully handles every content shape &mdash; <code>tool</code> messages (marked only when native Anthropic), empty content, raw strings (promoted to a text block), and content lists (mark the last block) &mdash; and supports the <code>1h</code> TTL marker <code class="cite">agent/prompt_caching.py:15-38</code>. It&rsquo;s a pure function with no agent-state dependency, which makes it trivially testable.</p>
+</section>
+
+<section id="routing">
+<h2>Smart model routing + local-server fingerprinting</h2>
+<p>Two smaller-but-tasteful pieces. <code>smart_model_routing.choose_cheap_model_route</code> downshifts <em>only</em> truly trivial turns to a cheap model and is <strong>conservative by construction</strong>: it bails back to the primary model if the message exceeds char/word caps, has more than one newline, contains backticks or a URL, or matches any of ~40 complexity keywords (<code>debug</code>, <code>refactor</code>, <code>traceback</code>, <code>pytest</code>, <code>docker</code>, &hellip;) <code class="cite">agent/smart_model_routing.py:11-46</code>. Default thresholds are tight (160 chars / 28 words), and any runtime-resolution failure silently falls back to primary, returning a stable <code>signature</code> tuple used to detect whether the model actually changed <code class="cite">agent/smart_model_routing.py:80-107</code>.</p>
+<p><code>model_metadata.detect_local_server_type</code> fingerprints whatever local inference server is running by <strong>probing known endpoints in specificity order</strong>: LM Studio&rsquo;s <code>/api/v1/models</code> first, then Ollama&rsquo;s <code>/api/tags</code> (verifying the body actually contains <code>models</code>, because LM Studio returns 200 with an error body on that path), then llama.cpp&rsquo;s <code>/v1/props</code> (with a <code>/props</code> fallback for old builds), then vLLM&rsquo;s <code>/version</code> <code class="cite">agent/model_metadata.py:308-364</code>.</p>
+<div class="callout info"><strong>Graceful degradation.</strong> Each probe has a 2s timeout and swallows failures, so a misconfigured <code>base_url</code> degrades gracefully rather than hanging. The result feeds context-window detection, so a local model&rsquo;s true context length is discovered rather than guessed.</div>
+</section>
+
+<section id="extensibility">
+<h2>Hooks, ACP adapter, and recursive toolset resolution</h2>
+<p>Three smaller systems round out the extensibility surface.</p>
+
+<h3>Filesystem-discovered hooks</h3>
+<p>Drop a directory with <code>HOOK.yaml</code> + <code>handler.py</code> into <code>~/.hermes/hooks/</code>, declare lifecycle events, and the registry dynamically loads the module and registers <code>handle()</code> per event. The emit path supports <strong>wildcard fan-out</strong> (<code>command:*</code> fires for any <code>command:&hellip;</code>) and runs both sync and coroutine handlers, with every handler wrapped in try/except so &ldquo;errors in hooks &hellip; never block the main pipeline&rdquo; <code class="cite">gateway/hooks.py:138-170</code>. Built-in hooks like <code>boot_md</code> are registered separately so they&rsquo;re always active <code class="cite">gateway/hooks.py:54-67</code>.</p>
+
+<h3>ACP adapter renders real diffs</h3>
+<p>The ACP adapter lets editors like Zed drive Hermes over the Agent Client Protocol. It maps every Hermes tool to an ACP <code>ToolKind</code> (<code>read</code>/<code>edit</code>/<code>execute</code>/<code>fetch</code>/<code>think</code>) and renders rich tool events: <code>write_file</code> and <code>patch</code> emit a <strong>proper diff content block</strong> via <code>acp.tool_diff_content(old_text, new_text)</code> so the editor shows a real inline diff, and <code>terminal</code> renders as <code>$ command</code> <code class="cite">acp_adapter/tools.py:104-174</code>. It also extracts file locations (path + line) from tool args so the editor can jump to them <code class="cite">acp_adapter/tools.py:205-214</code>.</p>
+
+<h3>Cycle-safe toolset resolution</h3>
+<p>Toolset resolution is recursive with composition (<code>includes</code>) and proper <strong>cycle/diamond handling</strong>: a shared <code>visited</code> set is threaded across sibling includes, so a diamond dependency resolves once and a true cycle silently returns <code>[]</code> rather than recursing forever; <code>all</code>/<code>*</code> expand to every toolset using fresh per-branch <code>visited</code> copies <code class="cite">toolsets.py:447-497</code>.</p>
+</section>
+    </main>
+  </div>
+  <footer>
+    Hermes Agent engineering wiki · generated from a source-grounded multi-agent analysis of
+    <code>IgorTavcar/hermes-agent</code> (fork of <code>NousResearch/hermes-agent</code>).
+    Citations are <code>path:line</code> into the repo at analysis time. Diagrams render with
+    mermaid.js (needs network); otherwise they appear as text.
+  </footer>
+  <script>
+    // scrollspy: highlight the current section in the sidebar
+    const links = [...document.querySelectorAll('.sidebar a')];
+    const map = new Map(links.map(a => [a.getAttribute('href').slice(1), a]));
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          links.forEach(a => a.classList.remove('active'));
+          const a = map.get(e.target.id);
+          if (a) a.classList.add('active');
+        }
+      });
+    }, { rootMargin: '-80px 0px -70% 0px' });
+    document.querySelectorAll('main section[id]').forEach(s => obs.observe(s));
+  </script>
+</body>
+</html>
