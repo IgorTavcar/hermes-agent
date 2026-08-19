@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Inner &amp; Outer Loops · Hermes Fresh Wiki</title>
+  <link rel="stylesheet" href="./style.css">
+  <script defer src="./search-index.js"></script>
+  <script defer src="./wiki.js"></script>
+  <script src="./vendor/mermaid.min.js"></script>
+  <script>
+    window.addEventListener("DOMContentLoaded", function () {
+      if (!window.mermaid) return;
+      try {
+        mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "loose",
+          themeVariables: { fontFamily: "ui-monospace, monospace", fontSize: "13px",
+            primaryColor: "#171b24", primaryBorderColor: "#2d3543", primaryTextColor: "#e7ebf2",
+            lineColor: "#c9a93a", secondaryColor: "#12151c", tertiaryColor: "#0a0c10" } });
+        mermaid.run({ querySelector: "pre.mermaid" });
+      } catch (e) { console.error("mermaid render failed", e); }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="index.html"><span class="mark">☤</span> Hermes Agent <span class="sub">Fresh Wiki</span></a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="loops.html" class="active">Turn Loops</a>
+      <a href="kernels.html">LLM Kernels</a>
+      <a href="providers.html">Providers &amp; Tiers</a>
+      <a href="channels.html">Channels</a>
+      <a href="skills.html">Self-Adaptive Skills</a>
+      <a href="transfer.html">Transferables</a>
+    </nav>
+  </header>
+  <div class="layout">
+    <aside class="sidebar">
+      <p class="toc-title">On this page</p>
+      <ul>
+        <li><a href="#loop-stack">The loop stack</a></li>
+        <li><a href="#outer-intake">Outer: intake &amp; busy guard</a></li>
+        <li><a href="#outer-steering">Outer: steer / redirect / interrupt</a></li>
+        <li><a href="#outer-chain">Outer: the turn chain</a></li>
+        <li><a href="#outer-nudges">Outer: nudges</a></li>
+        <li><a href="#outer-cron">Outer: cron wakeups</a></li>
+        <li><a href="#outer-idle">Outer: idle &amp; lifecycle</a></li>
+        <li><a href="#inner-header">Inner: loop header &amp; budget</a></li>
+        <li><a href="#inner-request">Inner: request assembly</a></li>
+        <li><a href="#inner-retry">Inner: retry sub-loop</a></li>
+        <li><a href="#inner-compaction">Inner: compaction triggers</a></li>
+        <li><a href="#inner-response">Inner: response handling</a></li>
+        <li><a href="#inner-finalize">Inner: finalization</a></li>
+        <li><a href="#tool-layer">Tool execution layer</a></li>
+        <li><a href="#invariants">The invariants</a></li>
+      </ul>
+    </aside>
+    <main>
+<div class="hero">
+<h1 class="page-title">Inner &amp; Outer Loops</h1>
+<p class="lead">The heart of Hermes is two loops: an <strong>outer loop</strong> that owns a session — intake, queueing, steering, interrupts, nudges, cron wakeups, idle lifecycle — and an <strong>inner loop</strong> that owns a turn — one LLM call plus one tool batch, repeated under an iteration budget until the model produces plain text. This page walks both in algorithmic detail, with the actual loop bodies and the ordering invariants that make them safe.</p>
+</div>
+
+<section id="loop-stack">
+<h2>The loop stack</h2>
+<p>There are really four nested control layers, plus a retry sub-loop:</p>
+<table class="grid">
+<thead><tr><th>Layer</th><th>Owner</th><th>Unit of work</th><th>Where</th></tr></thead>
+<tbody>
+<tr><td>L0 — transport/wakeup</td><td>platform adapters, cron ticker, <code>/loop</code>, goal loop</td><td>one inbound event</td><td><code class="cite">gateway/platforms/base.py:5981</code>, <code class="cite">cron/scheduler_provider.py:505</code></td></tr>
+<tr><td>L1 — session serialization</td><td>adapter guard + turn-lease registry</td><td>one session</td><td><code class="cite">gateway/platforms/base.py:5818</code>, <code class="cite">gateway/turn_lease.py:152</code></td></tr>
+<tr><td>L2 — <strong>outer loop</strong> (turn chain)</td><td><code>_run_agent_inner</code> recursive drain</td><td>one user turn + queued follow-ups</td><td><code class="cite">gateway/run.py:27763</code></td></tr>
+<tr><td>L3 — <strong>inner loop</strong> (tool loop)</td><td><code>run_conversation</code></td><td>one LLM call + tool batch</td><td><code class="cite">agent/conversation_loop.py:1922</code></td></tr>
+<tr><td>L3.5 — retry sub-loop</td><td><code>while retry_count &lt; max_retries</code></td><td>one API attempt</td><td><code class="cite">agent/conversation_loop.py:2741</code></td></tr>
+<tr><td>L4 — tool batch execution</td><td>segmented parallel/sequential executor</td><td>one tool call</td><td><code class="cite">agent/tool_executor.py:1048</code></td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="outer-intake">
+<h2>Outer loop: intake and the three-level busy guard</h2>
+<p>Every inbound message crosses three gates before it can start a turn:</p>
+<ol>
+<li><strong>Adapter guard (synchronous).</strong> If the session already has an entry in <code>_active_sessions</code>, the message goes to the busy handler instead of the runner (<code class="cite">gateway/platforms/base.py:6151</code>). Photo bursts merge, text may debounce, otherwise the message lands in the per-session pending slot (<code class="cite">gateway/platforms/base.py:6182</code>). For an idle session the guard is installed <em>before</em> the task spawn to close the race — the code cites grammY's <code>sequentialize</code> pattern (<code class="cite">gateway/platforms/base.py:6190</code>).</li>
+<li><strong>Runner busy handler.</strong> <code>_handle_active_session_busy_message</code> (<code class="cite">gateway/run.py:9945</code>) decides steer vs redirect vs interrupt vs queue (next section).</li>
+<li><strong>Turn lease.</strong> <code>SessionTurnLeaseRegistry</code> holds an <code>asyncio.Lock</code> per <em>resolved session_id</em> — not routing key — so two routing keys mapped to one session serialize; timeout raises and the caller must not enter the load/run/flush region: fail closed (<code class="cite">gateway/turn_lease.py:191</code>).</li>
+</ol>
+<p>Queueing is a single head slot with album-merge semantics plus an overflow FIFO behind it (<code class="cite">gateway/run.py:9852</code>). The historical bug is documented inline: the old overwrite path silently mashed two user messages into one turn (<code class="cite">gateway/run.py:9853</code>).</p>
+</section>
+
+<section id="outer-steering">
+<h2>Outer loop: steer / redirect / interrupt</h2>
+<p>The busy handler resolves an effective mode from <code>display.busy_input_mode</code> ∈ <code>{interrupt, queue, steer}</code> (default <code>interrupt</code>, <code class="cite">gateway/run.py:9369</code>) and then applies two <strong>safety demotions</strong>: interrupt is demoted to queue when subagents are active — an interrupt cascades into children and would destroy minutes of work — and when compression is in flight (<code class="cite">gateway/run.py:10112</code>, <code class="cite">gateway/run.py:10123</code>).</p>
+<table class="grid">
+<thead><tr><th>Verb</th><th>Semantics</th><th>Where</th></tr></thead>
+<tbody>
+<tr><td><code>steer(text)</code></td><td>Appends guidance to the last tool result at the next iteration boundary. Never kills anything.</td><td><code class="cite">run_agent.py:3381</code>, applied at <code class="cite">gateway/run.py:10162</code></td></tr>
+<tr><td><code>redirect(text)</code></td><td>Aborts only the in-flight <em>model request</em> (never a running tool — it degrades to steer while tools execute, <code class="cite">run_agent.py:3457</code>) and re-anchors the turn on the new text.</td><td><code class="cite">run_agent.py:3417</code>, applied at <code class="cite">gateway/run.py:10180</code></td></tr>
+<tr><td><code>interrupt(text)</code></td><td>Kills the model request and fans the interrupt out to all tool worker threads and children.</td><td><code class="cite">run_agent.py:3180</code></td></tr>
+</tbody>
+</table>
+<p>The <strong>queue-unless-consumed invariant</strong>: <code>if not steered and not redirected: queue it</code> — a successful steer must never also be replayed as a next-turn user message (<code class="cite">gateway/run.py:10200</code>). A separate 200&nbsp;ms poller inside the run task <em>peeks</em> (never pops) pending interrupts, so a message is never lost if the agent finishes first (<code class="cite">gateway/run.py:28437</code>).</p>
+</section>
+
+<section id="outer-chain">
+<h2>Outer loop proper: the recursive turn chain</h2>
+<p>The outer loop is <strong>tail recursion bounded by depth</strong>, not a <code>while</code>. After a turn returns, the runner drains follow-ups in priority order — pending queue, then <code>result["interrupt_message"]</code> (unless it is a control interrupt like "Stop requested", <code class="cite">gateway/run.py:3356</code>), then leftover <code>/steer</code> text — and recurses with <code>_interrupt_depth + 1</code>, capped at <code>_MAX_INTERRUPT_DEPTH = 3</code> (<code class="cite">gateway/run.py:25773</code>, recursion at <code class="cite">gateway/run.py:29307</code>).</p>
+<p>There is a second, adapter-level drain for follow-ups that land after the runner returned: it spawns a <em>fresh task</em> rather than awaiting recursively, because the old await chain grew one C-stack frame per follow-up and segfaulted around 2000 (<code class="cite">gateway/platforms/base.py:6765</code>). Crucially it <code>.clear()</code>s the guard Event but never deletes the <code>_active_sessions</code> entry — deleting would admit a second concurrent agent on the same session key (<code class="cite">gateway/platforms/base.py:6768</code>).</p>
+
+<pre class="mermaid">graph TD;
+  IN[inbound MessageEvent]-->G{session busy?};
+  G-->|no|T[spawn turn task];
+  G-->|yes|B{busy mode};
+  B-->|steer|S[agent.steer -> marker on last tool result];
+  B-->|redirect|R[agent.redirect -> abort model request only];
+  B-->|interrupt|I[agent.interrupt -> kill request + tools];
+  B-->|queue / demoted|Q[head slot + FIFO];
+  T-->RC[run_conversation = inner loop];
+  RC-->D[drain follow-ups: queue, interrupt_message, pending_steer];
+  D-->|found, depth < 3|T;
+  D-->|none|OUT[deliver + release lease];</pre>
+</section>
+
+<section id="outer-nudges">
+<h2>Outer loop: nudges (the learning-loop trigger)</h2>
+<p>Two counters drive the self-improvement machinery (detailed on <a href="skills.html">Self-Adaptive Skills</a>):</p>
+<ul>
+<li><strong>Memory nudge — turn-counted.</strong> <code>_turns_since_memory</code> increments per user turn; at <code>memory.nudge_interval</code> (default 10) it arms <code>should_review_memory</code> (<code class="cite">agent/turn_context.py:704</code>). The counter is hydrated from persisted history on session resume so a restart doesn't reset the clock (<code class="cite">agent/turn_context.py:655</code>).</li>
+<li><strong>Skill nudge — iteration-counted.</strong> <code>_iters_since_skill</code> increments once per API call inside the inner loop (<code class="cite">agent/conversation_loop.py:1989</code>) and is evaluated at turn end (<code class="cite">agent/turn_finalizer.py:771</code>). Both counters reset whenever the corresponding tool is actually used (<code class="cite">agent/tool_executor.py:667</code>).</li>
+</ul>
+<p>When either fires, the finalizer forks a background review agent <em>after delivery</em> (<code class="cite">agent/turn_finalizer.py:791</code>) — a daemon thread with tools restricted to memory + skills. A still-running review from the previous turn is cancelled at the top of the next turn so two forks never make concurrent API calls on the same credentials (<code class="cite">agent/conversation_loop.py:1780</code>).</p>
+<div class="callout key"><strong>Nudges are not prompt injections.</strong> The turn prologue explicitly preserves the original user message (<code class="cite">agent/turn_context.py:700</code>); the nudge is a boolean flag that spawns an out-of-band fork. The live conversation never sees it.</div>
+</section>
+
+<section id="outer-cron">
+<h2>Outer loop: scheduled cron wakeups</h2>
+<p>The ticker is a daemon-thread loop inside the gateway process (<code class="cite">cron/scheduler_provider.py:559</code>) with a 60&nbsp;s interval, exponential backoff on consecutive failures, and — deliberately — <code>except BaseException</code>, so a <code>SystemExit</code> escaping a provider SDK cannot silently kill scheduling. Each <code>tick()</code> (<code class="cite">cron/scheduler.py:6730</code>): reap dead-owner executions → collect due jobs → sweep stale in-flight claims → <strong>advance <code>next_run_at</code> first, under the file lock</strong> (at-most-once semantics, <code class="cite">cron/scheduler.py:6901</code>) → partition workdir-mutating jobs onto a sequential pool → claim at execution start, not submit time (<code class="cite">cron/scheduler.py:6935</code>) → run.</p>
+<p>A cron turn runs <code>run_conversation</code> on a single-worker pool with a copied contextvar context so the ticker thread can watchdog it on <em>idle</em> seconds — not wall clock — and hard-interrupt on inactivity (<code class="cite">cron/scheduler.py:5639</code>). Cron sets <code>skip_background_review=True</code>: review forks cost ~30K tokens per event and cron has no human in the loop (<code class="cite">agent/turn_finalizer.py:788</code>). A global <code>ESTOP</code> file pauses all new dispatch without killing in-flight work (<code class="cite">agent/estop.py:1</code>).</p>
+</section>
+
+<section id="outer-idle">
+<h2>Outer loop: idle behavior &amp; session lifecycle</h2>
+<ul>
+<li><strong>Per-turn inactivity watchdog</strong> — a thread (so it survives event-loop starvation) polling <code>seconds_since_activity</code>; timeout default 1800&nbsp;s of <em>idle</em> time, so a busy turn can legally run for hours (<code class="cite">gateway/run.py:3320</code>). Activity is stamped at every meaningful point: API call start, stream chunk received, tool start, tool results posted, backoff heartbeats (<code class="cite">run_agent.py:3918</code>).</li>
+<li><strong>Session reset/expiry</strong> — mode ∈ <code>{none, idle, daily, both}</code>; both paths refuse to expire a session that still has live background processes (<code class="cite">gateway/session.py:2424</code>, <code class="cite">gateway/session.py:2326</code>).</li>
+<li><strong>Scale-to-zero</strong> — when idle (no in-flight turn, no inbound, no background work), the gateway goes dormant and self-suspends via the Fly Machines socket, because the Fly proxy judges idleness on inbound connections only and cannot see an in-flight turn (<code class="cite">gateway/scale_to_zero.py:1</code>). Wakeups deliver a synthetic internal <code>MessageEvent</code>, or a self-POST for stateless adapters (<code class="cite">gateway/wake.py:1</code>).</li>
+<li><strong>Other outer loops</strong> — <code>/loop</code> recurring in-session wakeups that fire only while the session is idle (<code class="cite">hermes_cli/loops.py:1</code>), and the Ralph-style kanban goal loop (<code class="cite">hermes_cli/goals.py:2189</code>).</li>
+</ul>
+</section>
+
+<section id="inner-header">
+<h2>Inner loop: header, budget, and steer drain</h2>
+<p>Entry is <code>run_conversation</code> at <code class="cite">agent/conversation_loop.py:1704</code>. The prologue (<code>build_turn_context</code>, <code class="cite">agent/turn_context.py:431</code>) does everything once-per-turn: sanitize, hydrate nudge counters, restore-or-build the system prompt, run preflight compression, fire the <code>pre_llm_call</code> hook, prefetch external memory, and allocate a fresh <code>IterationBudget</code>. Then the loop head, verbatim:</p>
+<pre><code>while (api_call_count &lt; agent.max_iterations and agent.iteration_budget.remaining &gt; 0) or agent._budget_grace_call:
+    _redirect_text = agent._drain_pending_redirect()
+    ...
+    agent._checkpoint_mgr.new_turn()
+    if agent._interrupt_requested:
+        interrupted = True; break
+    api_call_count += 1
+    agent._touch_activity(f"starting API call #{api_call_count}")
+    ...budget consume or break...</code></pre>
+<p>(<code class="cite">agent/conversation_loop.py:1922</code>.) The budget (<code class="cite">agent/iteration_budget.py:17</code>) is a lock-guarded counter with <code>consume()</code>/<code>refund()</code>; the gateway raises <code>max_iterations</code> to 500 (<code class="cite">gateway/run.py:2042</code>), and each subagent gets an <em>independent</em> budget (default 50), so total iterations across a delegation tree can exceed the parent cap.</p>
+<p>A steer that arrived during the previous API call is drained <em>before</em> request assembly and appended to the last <code>role:"tool"</code> message so the model sees it on this iteration; on a first iteration with no tool message, it is put back rather than breaking role alternation (<code class="cite">agent/conversation_loop.py:2005</code>).</p>
+</section>
+
+<section id="inner-request">
+<h2>Inner loop: request assembly</h2>
+<ol>
+<li>Sanitize tool-call arguments with a <strong>prefix cursor</strong> so already-validated history isn't re-parsed every iteration (<code class="cite">agent/conversation_loop.py:2062</code>).</li>
+<li>Drop legacy ghost interrupt-scaffold rows (<code class="cite">agent/conversation_loop.py:2081</code>).</li>
+<li>Repair role alternation (<code>tool → user</code>, <code>user → user</code> tails) and recompute the flush cursor (<code class="cite">agent/conversation_loop.py:2109</code>).</li>
+<li>Build <code>api_messages</code> by <strong>structural clone</strong> — never <code>msg.copy()</code> — so in-place transforms can't corrupt the durable transcript (<code class="cite">agent/conversation_loop.py:2118</code>).</li>
+<li>Pre-API compression gate (below), then per-provider prompt-cache re-decoration and <code>_build_api_kwargs</code> (<code class="cite">agent/conversation_loop.py:2807</code>), then a whole-payload surrogate sanitization chokepoint (<code class="cite">agent/conversation_loop.py:2832</code>).</li>
+</ol>
+</section>
+
+<section id="inner-retry">
+<h2>Inner loop: retry sub-loop and the API call</h2>
+<p>Each iteration runs <code>while retry_count &lt; max_retries</code> (default 3, <code class="cite">agent/conversation_loop.py:2741</code>) with a fresh <code>TurnRetryState</code> holding ~16 one-shot recovery guards plus four restart signals (<code class="cite">agent/turn_retry_state.py:33</code>). Streaming is the default; the call is dispatched through middleware to either the interruptible streaming transport or <code>relay_llm.execute</code> (<code class="cite">agent/conversation_loop.py:3019</code>).</p>
+<p>The trickiest ordering guarantee is the <strong>redirect-crossing window</strong>: <code>_model_request_active</code> is set and cleared under the same lock <code>redirect()</code> observes, so a response and a redirect that cross on different threads cause the now-stale response to be <em>discarded</em>, never silently delivered (<code class="cite">agent/conversation_loop.py:3056</code>). Inside a stream, the chunk loop touches activity per chunk, checks the interrupt flag, and closes the stream <em>on the owning thread</em> — abandoning a half-read SSE response would permanently leak the pooled connection (<code class="cite">agent/chat_completion_helpers.py:4038</code>).</p>
+<p>Backoff sleeps in 200&nbsp;ms slices so interrupts land immediately and 30&nbsp;s activity touches keep the watchdog fed (<code class="cite">agent/conversation_loop.py:6415</code>). After the retry loop, every restart signal — redirected, compressed, rebuilt-on-fallback, length-continuation — rewinds <code>api_call_count</code> and refunds the budget, so a rebuilt request never costs an iteration (<code class="cite">agent/conversation_loop.py:6452</code>).</p>
+</section>
+
+<section id="inner-compaction">
+<h2>Inner loop: compaction triggers &amp; token accounting</h2>
+<p>Post-response, usage is normalized into canonical buckets and fed to <code>context_compressor.update_from_response</code> (<code class="cite">agent/conversation_loop.py:4028</code>). Three compaction trigger sites share one <code>compression_attempts</code> counter (cap 3):</p>
+<ol>
+<li><strong>Turn-prologue preflight</strong> — with a "defer to real usage" guard so a noisy rough estimate doesn't trigger compaction the provider's own prompt count would refute (<code class="cite">agent/turn_context.py:860</code>).</li>
+<li><strong>Pre-API mid-turn preflight</strong> — because a single turn can balloon on tool results while the post-response gate only sees lagging counts (<code class="cite">agent/conversation_loop.py:2557</code>). A lock-skip <em>refunds</em> the attempt: a defer is not evidence about compressibility.</li>
+<li><strong>Post-tool-batch gate</strong> — on real prompt tokens only (reasoning tokens inflate completion counts and caused premature compaction), with a sentinel for "compaction just ran, no reading yet" and a schema-inclusive rough estimate as last resort (<code class="cite">agent/conversation_loop.py:7305</code>).</li>
+</ol>
+<p>When over threshold but blocked, a deterministic LLM-free prune of old tool results runs instead (<code class="cite">agent/context_compressor.py:3691</code>). The compression budget <strong>rearms only on provider-confirmed recovery</strong> — a real prompt count below threshold on the request immediately after compaction (<code class="cite">agent/conversation_loop.py:4021</code>). The decision threshold is <code>(context_length − max_tokens) × threshold_percent</code> (default 0.50), with an 85% ratio fallback so small-context models can ever compact (<code class="cite">agent/context_compressor.py:2768</code>).</p>
+</section>
+
+<section id="inner-response">
+<h2>Inner loop: response handling</h2>
+<p>The branch is simply <code>if assistant_message.tool_calls:</code> (<code class="cite">agent/conversation_loop.py:6820</code>).</p>
+<p><strong>Tool-call path</strong> runs a validation ladder — duplicate-id uniquify, fuzzy name repair, mixed-batch partial erroring, 3-strike all-invalid handling, JSON arg validation, truncation detection, invalid-JSON recovery injected as <em>tool-role</em> results (never user messages: role alternation) — then the two invariants: the assistant message is appended and <strong>flushed to SQLite before any tool executes</strong> (a destructive tool can restart Hermes; resume logic must see the exact tool-call block that ran, <code class="cite">agent/conversation_loop.py:7161</code>), and a flush failure aborts the turn rather than executing from process-local state. Batches consisting only of <code>execute_code</code> refund their iteration (<code class="cite">agent/conversation_loop.py:7288</code>).</p>
+<p><strong>Final-response path</strong> is an ordered ladder of continuation gates, each able to set <code>final_response = None</code> and continue: codex intermediate-ack continuation (cap 2), length-continuation joining, dropped-tool-call re-prompt (cap 3, <code class="cite">agent/conversation_loop.py:7926</code>), scaffolding strip, verify-on-stop nudge, <code>pre_verify</code> hook nudge, kanban terminal-tool nudge — then terminate (<code class="cite">agent/conversation_loop.py:8156</code>). An empty-response recovery ladder runs first: partial-stream salvage → cached housekeeping content → post-tool nudge → thinking prefill → bounded empty retries with a deterministic-empty detector → fallback provider (<code class="cite">agent/conversation_loop.py:7473</code>).</p>
+<p>The outer <code>except</code> classifies errors by walking traceback module names: a deterministic <em>local-processing</em> bug would fail identically every iteration and only burn budget, so it stops immediately; API errors retry. Either way, orphaned <code>tool_call_id</code>s get error results filled in (<code class="cite">agent/conversation_loop.py:8180</code>).</p>
+</section>
+
+<section id="inner-finalize">
+<h2>Inner loop: finalization</h2>
+<p><code>finalize_turn</code> (<code class="cite">agent/turn_finalizer.py:120</code>): if a verification gate withheld an answer and the budget then ran out, that exact answer is reused rather than paying for another fallible call; otherwise budget exhaustion triggers <em>one</em> extra toolless API call asking for a summary (<code class="cite">agent/turn_finalizer.py:192</code>). Then: persist, return leftover steer as <code>pending_steer</code>, clear interrupts, evaluate the skill nudge, sync external memory, spawn the background review, fire <code>on_session_end</code>, and return the result dict (final_response, exit reason, token buckets, cost, flags).</p>
+
+<pre class="mermaid">graph TD;
+  P[prologue: turn_context + preflight compression]-->W{budget loop};
+  W-->RD[drain redirect/steer];
+  RD-->AS[assemble api_messages + cache marks];
+  AS-->CG{pre-API compress?};
+  CG-->RT[retry sub-loop: stream call + recovery guards];
+  RT-->|restart signal|REF[refund budget, rewind count];
+  REF-->W;
+  RT-->U[token accounting + compressor update];
+  U-->BR{tool calls?};
+  BR-->|yes|V[validate ladder];
+  V-->FL[append + FLUSH to SQLite];
+  FL-->EX[execute tool batch];
+  EX-->PC{post-tool compress?};
+  PC-->W;
+  BR-->|no|LD[continuation ladder: ack, length, dropped-calls, verify nudges];
+  LD-->|continue|W;
+  LD-->F[final message, break];
+  F-->FIN[finalize_turn: persist, nudges, background review];</pre>
+</section>
+
+<section id="tool-layer">
+<h2>Tool execution layer</h2>
+<p>Dispatch selection (<code class="cite">run_agent.py:8170</code>): a single call runs sequential; a batch is planned into <strong>segments</strong> — maximal contiguous parallel-safe runs separated by sequential barriers, preserving the model's emission order exactly (<code class="cite">agent/tool_dispatch_helpers.py:117</code>). Path-scoped tools carry reader/writer reservations: reader↔reader overlap commutes, any writer overlap closes the run; <code>search_files</code> reserves its root as a reader so a search after a write into that subtree is ordered behind it.</p>
+<ul>
+<li><strong>Concurrent executor</strong> (<code class="cite">agent/tool_executor.py:1048</code>): up to 8 workers on a <code>DaemonThreadPoolExecutor</code> — daemon because a wedged non-daemon worker would block interpreter exit forever (<code class="cite">agent/tool_executor.py:1458</code>). A <strong>start-order gate</strong> serializes dispatch by submit order even though execution is parallel, so approval prompts appear in order; on gate timeout it proceeds out of order rather than starving (<code class="cite">agent/tool_executor.py:1200</code>).</li>
+<li><strong>Deadlines</strong>: 420&nbsp;s batch default, with human-approval wait time <em>excluded</em> from the deadline (<code class="cite">agent/tool_executor.py:1526</code>). On abandon: <code>shutdown(wait=False, cancel_futures=True)</code> — wedged workers are left detached rather than deadlocking the batch (<code class="cite">agent/tool_executor.py:1622</code>).</li>
+<li><strong>Results</strong>: pre-allocated slots appended in original call order — wall-clock completion order never leaks into the transcript (<code class="cite">agent/tool_executor.py:1172</code>). Every <code>tool_call_id</code> gets exactly one result on every path: success, error, skip, cancel, timeout, interpreter shutdown.</li>
+<li><strong>Untrusted-output framing</strong>: results from high-risk tools (web, browser, MCP) are wrapped in semantic delimiters marking them as data, not instructions — the single-chokepoint defense against indirect prompt injection (<code class="cite">agent/tool_dispatch_helpers.py:534</code>).</li>
+<li><strong>Steer injection</strong> happens after the whole batch and after budget enforcement, so a steer marker can never be truncated by output budgeting (<code class="cite">agent/tool_executor.py:1855</code>).</li>
+</ul>
+</section>
+
+<section id="invariants">
+<h2>The invariants (condensed)</h2>
+<table class="grid">
+<thead><tr><th>#</th><th>Invariant</th><th>Where</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>One turn per session, enforced three times (adapter guard, busy handler, turn lease — fail closed).</td><td><code class="cite">gateway/turn_lease.py:191</code></td></tr>
+<tr><td>2</td><td>Clear the guard Event on drain, never delete the entry — deleting admits a second concurrent agent.</td><td><code class="cite">gateway/platforms/base.py:6768</code></td></tr>
+<tr><td>3</td><td>Canonical persistence precedes side effects: the assistant tool-call row is flushed before tools run; a flush failure aborts the turn.</td><td><code class="cite">agent/conversation_loop.py:7161</code></td></tr>
+<tr><td>4</td><td>Every tool_call_id gets exactly one result across all exit paths.</td><td><code class="cite">agent/conversation_loop.py:8227</code></td></tr>
+<tr><td>5</td><td>A transcript must never end on a tool row — strict providers hallucinate continuations otherwise.</td><td><code class="cite">agent/message_sanitization.py:296</code></td></tr>
+<tr><td>6</td><td>Rebuild-and-retry never costs an iteration: rewind + refund on every restart signal; execute_code batches refunded.</td><td><code class="cite">agent/conversation_loop.py:6452</code></td></tr>
+<tr><td>7</td><td>A response that crossed a redirect is discarded, not delivered.</td><td><code class="cite">agent/conversation_loop.py:3094</code></td></tr>
+<tr><td>8</td><td>Never serialize raw chain-of-thought into replayable content — a poisoned checkpoint reads as a prefill jailbreak to provider classifiers and bricks the session with deterministic empty-response storms.</td><td><code class="cite">agent/conversation_loop.py:268</code></td></tr>
+<tr><td>9</td><td>Timeouts are idle-based, not wall-clock; long busy turns are legal.</td><td><code class="cite">gateway/run.py:3320</code></td></tr>
+<tr><td>10</td><td>Cron advances next_run_at under the file lock before executing — at-most-once semantics.</td><td><code class="cite">cron/scheduler.py:6901</code></td></tr>
+<tr><td>11</td><td>Compaction budget rearms only on provider-confirmed recovery; compression decisions use prompt tokens only.</td><td><code class="cite">agent/conversation_loop.py:4021</code></td></tr>
+<tr><td>12</td><td>Untrusted tool output is framed as data, not instructions, at one chokepoint.</td><td><code class="cite">agent/tool_dispatch_helpers.py:534</code></td></tr>
+</tbody>
+</table>
+</section>
+    </main>
+  </div>
+  <footer>
+    Hermes Agent fresh wiki · grounded 2026-08-19 against commit <code>42a4c91c4</code>
+    for <code>IgorTavcar/hermes-agent</code> (fork of <code>NousResearch/hermes-agent</code>);
+    citations are <code>path:line</code> into the working tree; diagrams render offline via vendored mermaid.
+  </footer>
+  <script>
+    const links = [...document.querySelectorAll('.sidebar a')];
+    const map = new Map(links.map(a => [a.getAttribute('href').slice(1), a]));
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          links.forEach(a => a.classList.remove('active'));
+          const a = map.get(e.target.id);
+          if (a) a.classList.add('active');
+        }
+      });
+    }, { rootMargin: '-80px 0px -70% 0px' });
+    document.querySelectorAll('main section[id]').forEach(s => obs.observe(s));
+  </script>
+</body>
+</html>

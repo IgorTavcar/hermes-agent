@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hermes Agent — Fresh Engineering Wiki</title>
+  <link rel="stylesheet" href="./style.css">
+  <script defer src="./search-index.js"></script>
+  <script defer src="./wiki.js"></script>
+  <script src="./vendor/mermaid.min.js"></script>
+  <script>
+    window.addEventListener("DOMContentLoaded", function () {
+      if (!window.mermaid) return;
+      try {
+        mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "loose",
+          themeVariables: { fontFamily: "ui-monospace, monospace", fontSize: "13px",
+            primaryColor: "#171b24", primaryBorderColor: "#2d3543", primaryTextColor: "#e7ebf2",
+            lineColor: "#c9a93a", secondaryColor: "#12151c", tertiaryColor: "#0a0c10" } });
+        mermaid.run({ querySelector: "pre.mermaid" });
+      } catch (e) { console.error("mermaid render failed", e); }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="index.html"><span class="mark">☤</span> Hermes Agent <span class="sub">Fresh Wiki</span></a>
+    <nav>
+      <a href="index.html" class="active">Overview</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="loops.html">Turn Loops</a>
+      <a href="kernels.html">LLM Kernels</a>
+      <a href="providers.html">Providers &amp; Tiers</a>
+      <a href="channels.html">Channels</a>
+      <a href="skills.html">Self-Adaptive Skills</a>
+      <a href="transfer.html">Transferables</a>
+    </nav>
+  </header>
+  <div class="layout">
+    <aside class="sidebar">
+      <p class="toc-title">On this page</p>
+      <ul>
+        <li><a href="#what">What Hermes is</a></li>
+        <li><a href="#pages">What's in this wiki</a></li>
+        <li><a href="#bird">A message end to end</a></li>
+        <li><a href="#reading">How to read the codebase</a></li>
+        <li><a href="#provenance">Provenance &amp; grounding</a></li>
+      </ul>
+    </aside>
+    <main>
+<div class="hero">
+<h1 class="page-title">Hermes Agent — Fresh Engineering Wiki</h1>
+<p class="lead">Hermes Agent is a self-improving, multi-platform AI agent harness from Nous Research (MIT-licensed). It wraps any chat model in everything it needs to act in the world — a terminal, a filesystem, web and code execution, memory, and a gateway onto messaging platforms — and drives every user message to completion through one provider-agnostic turn loop. This wiki is a from-the-code reference: how Hermes is built, what makes it work, and which ideas transfer to any agent harness. Every claim is a <code>path:line</code> citation into this repository at commit <code>42a4c91c4</code>.</p>
+</div>
+
+<section id="what">
+<h2>What Hermes is</h2>
+<p>The entire system is a set of thin drivers around one agent core: the <code>AIAgent</code> class (<code class="cite">run_agent.py:412</code>) and its single production turn loop, <code>run_conversation</code> (<code class="cite">agent/conversation_loop.py:1704</code>). The CLI, the TUI, the multi-platform gateway daemon, the cron scheduler, the ACP adapter and the batch runner all feed the <em>same</em> loop — they differ only in how messages get in and how replies flow out. There is no second code path.</p>
+<p>It is provider-agnostic by design, speaking to ~40 backends through four API dialects (OpenAI ChatCompletion, Anthropic Messages, OpenAI Responses/Codex, Bedrock Converse) — including subscription-OAuth backends like ChatGPT Plus and Claude Pro/Max — with provider differences quarantined inside per-dialect transports so the loop body stays uniform. And it is genuinely self-improving: it creates skills from experience, patches them during use, nudges itself to persist knowledge, and searches its own past conversations.</p>
+<div class="callout key"><strong>The core is deliberately simple, the edges deliberately paranoid.</strong> The loop head is a plain synchronous <code>while (api_call_count &lt; max_iterations and iteration_budget.remaining &gt; 0)</code> (<code class="cite">agent/conversation_loop.py:1922</code>). Almost everything else in the repo is scaffolding to feed, protect, persist and observe that loop — and almost every non-obvious choice traces back to protecting the context window, surviving rate limits, or making stateless infra behave statefully. See <a href="transfer.html">Transferables</a>.</div>
+</section>
+
+<section id="pages">
+<h2>What's in this wiki</h2>
+<div class="card-grid">
+<a class="card" href="architecture.html">
+<h3>Architecture &amp; Internals</h3>
+<p>The one shared core, the entry points and process model, the gateway inbound/outbound pipeline, session keying and the SQLite state DB, subagent delegation, the <code>execute_code</code> RPC, and the four extension surfaces.</p>
+<span class="card-go">Read the map →</span>
+</a>
+<a class="card" href="loops.html">
+<h3>Inner &amp; Outer Loops</h3>
+<p>The outer loop that owns a session — intake, steering, interrupts, nudges, cron, idle lifecycle — and the inner loop that owns a turn, with the actual loop bodies and the ordering invariants that keep them safe.</p>
+<span class="card-go">Read the loops →</span>
+</a>
+<a class="card" href="kernels.html">
+<h3>LLM Kernels &amp; Adapters</h3>
+<p>The client/adapter layer where inference, tool-calling and streaming execute per dialect — which SDKs are wrapped, how requests and tool schemas convert, how streaming and delta assembly work, prompt caching and reasoning params.</p>
+<span class="card-go">Read the kernels →</span>
+</a>
+<a class="card" href="providers.html">
+<h3>Providers &amp; Subscription Tiers</h3>
+<p>The provider catalog and, one by one, the subscription-contract integrations — Claude Pro/Max, ChatGPT/Codex, Grok, Copilot, Qwen, MiniMax, Nous — with OAuth flows, token stores, refresh, and client-identity spoofing.</p>
+<span class="card-go">Read the registry →</span>
+</a>
+<a class="card" href="channels.html">
+<h3>Messaging Channels</h3>
+<p>How the chat channels are built and set up — the quickest, cleanest paths for Telegram, WhatsApp (Baileys &amp; Cloud API) and Twilio SMS, plus Discord, Slack and Signal, with real config keys.</p>
+<span class="card-go">Read the setup →</span>
+</a>
+<a class="card" href="skills.html">
+<h3>Self-Adaptive Skills</h3>
+<p>The workflows that turn work-over-time into skills: the complexity trigger, the out-of-band review fork, ownership guards, memory nudges, FTS session search, Honcho user modeling, and the weekly curator.</p>
+<span class="card-go">Read the loop →</span>
+</a>
+<a class="card" href="transfer.html">
+<h3>Transferable Ideas</h3>
+<p>The best methods, algorithms and know-how that generalize to any agent harness — indexed by the scarce resource each defends, with the file to read and what to lift first.</p>
+<span class="card-go">Read the index →</span>
+</a>
+</div>
+</section>
+
+<section id="bird">
+<h2>A message, end to end</h2>
+<p>A bird's-eye view of how a single chat message flows through the system, from platform SDK to reply:</p>
+<pre class="mermaid">graph TD;
+  U[user message on Telegram/Discord/...]-->AD[platform adapter: MessageEvent + session key];
+  AD-->GD[gateway busy guard / pending FIFO];
+  GD-->RH[GatewayRunner._handle_message: reset vars, profile, hooks, auth];
+  RH-->SS[SessionStore.get_or_create + turn lease];
+  SS-->TR[TurnRunner.run_sync on thread pool];
+  TR-->RC[run_conversation = inner loop];
+  RC-->L{budget loop};
+  L-->K[build api_kwargs + cache marks];
+  K-->T[transport: convert + stream];
+  T-->N[normalize to uniform shape];
+  N-->B{tool calls?};
+  B-->|yes|FL[flush to SQLite -> execute batch];
+  FL-->L;
+  B-->|no|F[final response];
+  F-->FIN[finalize: persist, nudges, background review fork];
+  RC-->STR[live stream events -> user];
+  FIN-->OUT[deliver reply];</pre>
+</section>
+
+<section id="reading">
+<h2>How to read the codebase</h2>
+<p>Walking these files in order forms a spine from the turn loop out to the providers:</p>
+<table class="grid">
+<thead><tr><th>File</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td><code class="cite">run_agent.py</code></td><td>The <code>AIAgent</code> class (<code class="cite">run_agent.py:412</code>) and its public surface — thin forwarders into the <code>agent/</code> package.</td></tr>
+<tr><td><code class="cite">agent/conversation_loop.py</code></td><td>The production turn loop: entry at <code class="cite">agent/conversation_loop.py:1704</code>, budget loop at <code class="cite">agent/conversation_loop.py:1922</code>, retry sub-loop at <code class="cite">agent/conversation_loop.py:2741</code>.</td></tr>
+<tr><td><code class="cite">agent/tool_executor.py</code></td><td>Concurrent/sequential/segmented tool execution (<code class="cite">agent/tool_executor.py:1048</code>) with the start-order gate and daemon pool.</td></tr>
+<tr><td><code class="cite">agent/transports/</code></td><td>The four dialect transports — the format-conversion boundary (<code class="cite">agent/transports/base.py:1</code>).</td></tr>
+<tr><td><code class="cite">gateway/run.py</code></td><td>The gateway controller (<code class="cite">gateway/run.py:6547</code>), message pipeline (<code class="cite">gateway/run.py:16237</code>), turn runner (<code class="cite">gateway/run.py:27763</code>).</td></tr>
+<tr><td><code class="cite">hermes_state_common.py</code></td><td>The SQLite schema — sessions, messages, FTS5 (<code class="cite">hermes_state_common.py:249</code>).</td></tr>
+<tr><td><code class="cite">hermes_cli/auth.py</code></td><td>The provider registry and OAuth flows (<code class="cite">hermes_cli/auth.py:232</code>).</td></tr>
+<tr><td><code class="cite">agent/background_review.py</code></td><td>The self-improvement review fork (<code class="cite">agent/background_review.py:860</code>) and its prompts.</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="provenance">
+<h2>Provenance &amp; grounding</h2>
+<p>This is a fresh, from-the-code wiki, written independently of the earlier <code>wiki/</code> directory and the two generated reports at the repo root. Its content was re-derived from source by parallel code-exploration passes, and every <code>path:line</code> citation was spot-checked against the working tree at commit <code>42a4c91c4</code> (2026-08-19). Because line numbers drift as code changes, re-verify each <code>&lt;code class="cite"&gt;</code> after large merges. The search index is regenerated with <code>python3 wiki_fresh/build_search_index.py</code>; diagrams render offline from the vendored mermaid copy, with nothing loaded from a network.</p>
+<div class="callout warn"><strong>Caveat.</strong> Subscription-OAuth providers route real consumer subscriptions through agent traffic. Confirm such usage is within each provider's terms of service before relying on it in production; Hermes provides the transport, not the entitlement.</div>
+</section>
+    </main>
+  </div>
+  <footer>
+    Hermes Agent fresh wiki · grounded 2026-08-19 against commit <code>42a4c91c4</code>
+    for <code>IgorTavcar/hermes-agent</code> (fork of <code>NousResearch/hermes-agent</code>);
+    citations are <code>path:line</code> into the working tree; diagrams render offline via vendored mermaid.
+  </footer>
+  <script>
+    const links = [...document.querySelectorAll('.sidebar a')];
+    const map = new Map(links.map(a => [a.getAttribute('href').slice(1), a]));
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          links.forEach(a => a.classList.remove('active'));
+          const a = map.get(e.target.id);
+          if (a) a.classList.add('active');
+        }
+      });
+    }, { rootMargin: '-80px 0px -70% 0px' });
+    document.querySelectorAll('main section[id]').forEach(s => obs.observe(s));
+  </script>
+</body>
+</html>

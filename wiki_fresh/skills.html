@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Self-Adaptive Skills · Hermes Fresh Wiki</title>
+  <link rel="stylesheet" href="./style.css">
+  <script defer src="./search-index.js"></script>
+  <script defer src="./wiki.js"></script>
+  <script src="./vendor/mermaid.min.js"></script>
+  <script>
+    window.addEventListener("DOMContentLoaded", function () {
+      if (!window.mermaid) return;
+      try {
+        mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "loose",
+          themeVariables: { fontFamily: "ui-monospace, monospace", fontSize: "13px",
+            primaryColor: "#171b24", primaryBorderColor: "#2d3543", primaryTextColor: "#e7ebf2",
+            lineColor: "#c9a93a", secondaryColor: "#12151c", tertiaryColor: "#0a0c10" } });
+        mermaid.run({ querySelector: "pre.mermaid" });
+      } catch (e) { console.error("mermaid render failed", e); }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="index.html"><span class="mark">☤</span> Hermes Agent <span class="sub">Fresh Wiki</span></a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="loops.html">Turn Loops</a>
+      <a href="kernels.html">LLM Kernels</a>
+      <a href="providers.html">Providers &amp; Tiers</a>
+      <a href="channels.html">Channels</a>
+      <a href="skills.html" class="active">Self-Adaptive Skills</a>
+      <a href="transfer.html">Transferables</a>
+    </nav>
+  </header>
+  <div class="layout">
+    <aside class="sidebar">
+      <p class="toc-title">On this page</p>
+      <ul>
+        <li><a href="#five-loops">The five loops</a></li>
+        <li><a href="#format">Skill format &amp; storage</a></li>
+        <li><a href="#context">How skills reach context</a></li>
+        <li><a href="#creation">Autonomous creation</a></li>
+        <li><a href="#the-fork">What the review fork is</a></li>
+        <li><a href="#improve">Self-improvement during use</a></li>
+        <li><a href="#guards">The ownership guards</a></li>
+        <li><a href="#memory">Memory nudges</a></li>
+        <li><a href="#search">Session search / recall</a></li>
+        <li><a href="#honcho">Honcho user modeling</a></li>
+        <li><a href="#curator">The curator</a></li>
+        <li><a href="#caveats">Honest caveats</a></li>
+      </ul>
+    </aside>
+    <main>
+<div class="hero">
+<h1 class="page-title">Self-Adaptive Skills</h1>
+<p class="lead">The marketing claim — "creates skills from experience, improves them during use, nudges itself to persist knowledge, searches its own past conversations, builds a deepening model of who you are" — maps to real, specific machinery. This page documents the workflows that transform work-over-time into skills: the counter that decides a task was complex, the background fork that writes skills without touching the live conversation, the ownership guards that keep the agent from mutating what it doesn't own, and the weekly curator that consolidates the library.</p>
+</div>
+
+<section id="five-loops">
+<h2>The five loops</h2>
+<table class="grid">
+<thead><tr><th>Loop</th><th>Trigger</th><th>Actor</th><th>Writes to</th></tr></thead>
+<tbody>
+<tr><td><strong>A. Post-turn review</strong></td><td>turn / tool-iteration counter</td><td>forked <code>AIAgent</code>, tools = memory + skills</td><td><code>~/.hermes/skills/**</code>, <code>MEMORY.md</code>, <code>USER.md</code></td></tr>
+<tr><td><strong>B. <code>/refine</code></strong></td><td>user command</td><td>same fork + <code>focus</code></td><td>same</td></tr>
+<tr><td><strong>C. <code>/learn</code></strong></td><td>user command</td><td>the <em>live</em> foreground agent</td><td><code>~/.hermes/skills/**</code></td></tr>
+<tr><td><strong>D. Curator</strong></td><td>7-day interval + idle gate</td><td>deterministic pass + optional fork</td><td>lifecycle state, <code>.archive/</code>, umbrellas</td></tr>
+<tr><td><strong>E. Honcho dialectic</strong></td><td>every turn (cadenced)</td><td>Honcho cloud peer</td><td>external workspace, injected into context</td></tr>
+</tbody>
+</table>
+<p>The design intent is stated in the review module's own docstring: <em>"After every turn, run_conversation may fire off a daemon thread that replays the conversation snapshot in a forked AIAgent and asks itself 'should any skill/memory be saved or updated?'. Writes go straight to the memory + skill stores. Main conversation and prompt cache are never touched."</em> (<code class="cite">agent/background_review.py:1</code>).</p>
+</section>
+
+<section id="format">
+<h2>Skill format &amp; storage</h2>
+<p>Three shipped trees plus one runtime tree: <code>skills/</code> (82 bundled <code>SKILL.md</code> files), <code>optional-skills/</code> (117, installed on demand), and the user tree <code>~/.hermes/skills/</code> (<code class="cite">hermes_constants.py:1515</code>). The format is <strong>agentskills.io-compatible</strong> — YAML frontmatter + Markdown body, with an <code>assets/</code>/<code>references/</code>/<code>templates/</code>/<code>scripts/</code> layout (<code class="cite">tools/skills_tool.py:28</code>; allowed subdirs whitelisted at <code class="cite">tools/skill_manager_tool.py:520</code>).</p>
+<p>A hard validator enforces frontmatter shape and — <strong>on <code>create</code> only</strong> — a <code>description</code> ≤ 60 characters (<code class="cite">tools/skill_manager_tool.py:566</code>). That 60-char limit is the single highest-leverage constraint in the system: it gates creation, is repeated in three separate prompts, has its own linter rule, and its violation silently truncates the description so the skill never routes (<code class="cite">agent/learn_prompt.py:44</code>). A 12-rule advisory linter runs after every create (<code class="cite">tools/skill_linter.py:1</code>). Seeding never clobbers user edits: a bundled skill that changed <em>and</em> whose user copy diverged is skipped (<code class="cite">tools/skills_sync.py:13</code>).</p>
+</section>
+
+<section id="context">
+<h2>How skills reach the model's context — three tiers</h2>
+<ol>
+<li><strong>Always-on index in the system prompt.</strong> A <code>## Skills (mandatory)</code> block lists every skill's name + 60-char description and instructs: scan before replying, load with <code>skill_view(name)</code> if even partially relevant, patch it if it has issues, and offer to save one after difficult tasks (<code class="cite">agent/prompt_builder.py:2101</code>). The self-improvement instruction is baked into the always-loaded index itself.</li>
+<li><strong>Full body via <code>skill_view</code>.</strong> Loading a skill bumps both <code>view</code> and <code>use</code> telemetry — actively loading a skill to act on it counts as use, and the curator's stale timer keys off <code>last_used_at</code> (<code class="cite">tools/skills_tool.py:2135</code>).</li>
+<li><strong>Support files on demand</strong> via <code>skill_view(name, file_path="references/x.md")</code>.</li>
+</ol>
+<p>The index sits in the <em>volatile</em> prompt band, ahead of memory, precisely because skills are runtime-mutable — a stable-band placement would bust the cached prefix on every self-edit (<code class="cite">agent/system_prompt.py:765</code>). There is <strong>no embedding or semantic router</strong>: matching is the model reading descriptions plus deterministic frontmatter filters (platform gating, tool-dependency gating, disabled lists).</p>
+</section>
+
+<section id="creation">
+<h2>Autonomous skill creation — the trigger</h2>
+<p>"This task was complex" is operationalized as <strong>≥N tool iterations since the last <code>skill_manage</code> call</strong>. The counter <code>_iters_since_skill</code> increments once per tool-calling iteration (<code class="cite">agent/conversation_loop.py:1988</code>), resets when <code>skill_manage</code> is actually used (<code class="cite">agent/tool_executor.py:667</code>), and is checked at turn end against <code>skills.creation_nudge_interval</code> (default 10 in code, 15 in the example config) (<code class="cite">agent/turn_finalizer.py:770</code>). The spawn gate additionally requires a real final response, no interrupt, not a cron session, not a subagent, and the feature enabled (<code class="cite">run_agent.py:1832</code>).</p>
+<p>The prompt (<code>_SKILL_REVIEW_PROMPT</code>, <code class="cite">agent/background_review.py:259</code>) is emphatic and specific — a few load-bearing excerpts:</p>
+<blockquote>
+<p>"Be ACTIVE — most sessions produce at least one skill update… A pass that does nothing is a missed learning opportunity, not a neutral outcome."</p>
+<p>"Target shape of the library: CLASS-LEVEL skills, each with a rich SKILL.md and a <code>references/</code> directory… Not a long flat list of narrow one-session-one-skill entries."</p>
+<p>Preference order, earliest that fits: (1) update a currently-loaded skill, (2) update an existing umbrella, (3) add a support file, (4) create a new class-level umbrella. "If the proposed name only makes sense for today's task, it's wrong."</p>
+</blockquote>
+<p>And a negative half — the anti-sediment rules — that refuses to capture environment-dependent failures, negative claims about tools ("browser tools do not work" harden into refusals the agent cites against itself for months), transient errors, one-off narratives, and unresolved failures written up as reliable workflows (<code class="cite">agent/background_review.py:332</code>).</p>
+<div class="callout info"><strong>A content-filter scar worth knowing.</strong> The original skill-guidance wording ("After completing a complex task (5+ tool calls)…") tripped Anthropic's server-side filter on subscription OAuth credentials, surfacing as a billing-shaped HTTP 400. The reword is described in the code as "empirically validated, not understood" (<code class="cite">agent/prompt_builder.py:203</code>).</div>
+</section>
+
+<section id="the-fork">
+<h2>What the review fork actually is</h2>
+<p><code>_run_review_in_thread</code> (<code class="cite">agent/background_review.py:860</code>) builds a forked <code>AIAgent</code> with a stack of invariants, each fixing a real bug:</p>
+<table class="grid">
+<thead><tr><th>Property</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><code>max_iterations=16</code>, tool whitelist <code>{memory, skills}</code></td><td>bounded cost; other tools denied at runtime</td></tr>
+<tr><td><code>skip_memory=True</code></td><td>the fork must not touch external memory providers (three leak sites)</td></tr>
+<tr><td><code>_persist_disabled=True</code>, <code>_session_db=None</code></td><td><strong>the curator-takeover root cause</strong>: otherwise the harness prompt is written into the user's real session and re-read next turn as a standing instruction, making the agent "become" the curator</td></tr>
+<tr><td>cached system prompt inherited (same model)</td><td>prefix-cache hit — cited ~26% end-to-end cost reduction</td></tr>
+<tr><td><code>compression_enabled=False</code></td><td>sharing <code>session_id</code> means a compression race would fork the parent</td></tr>
+<tr><td>dangerous-command approvals auto-denied</td><td>prevents an <code>input()</code> deadlock against the TUI</td></tr>
+</tbody>
+</table>
+<p>Same-model reviews replay the full snapshot; a routed cheaper model replays a compact digest instead. Writes land on disk, provenance is stamped in <code>.usage.json</code>, an audit entry lands in <code>.curator_ledger.jsonl</code>, the skills prompt cache is cleared so the just-written skill is visible next turn, and the user sees <code>💾 Self-improvement review: &lt;actions&gt;</code>.</p>
+
+<pre class="mermaid">graph TD;
+  TI[tool iteration ++_iters_since_skill]-->RS{turn end: >= interval?};
+  RS-->|no|X[nothing];
+  RS-->|yes|GATE{final response? not cron? not subagent?};
+  GATE-->|yes|FORK[daemon thread 'bg-review'];
+  FORK-->CFG[forked AIAgent: whitelist memory+skills, persist disabled, 16 iters];
+  CFG-->REPLAY[replay snapshot / digest];
+  REPLAY-->READ[skills_list + skill_view];
+  READ-->WRITE[skill_manage create/patch/write_file];
+  WRITE-->G[5 ownership guards];
+  G-->DISK[SKILL.md + references + MEMORY.md + USER.md];
+  DISK-->CACHE[clear skills prompt cache];
+  CACHE-->NOTE['Self-improvement review: ...'];</pre>
+</section>
+
+<section id="improve">
+<h2>Skill self-improvement during use</h2>
+<p>There is no critique loop and no semver bumping — self-improvement is instruction plus telemetry:</p>
+<ul>
+<li>The system prompt's <code>SKILLS_GUIDANCE</code>: <em>"When using a skill and finding it outdated, incomplete, or wrong, patch it immediately with <code>skill_manage(action='patch')</code> — don't wait to be asked. Skills that aren't maintained become liabilities."</em> (<code class="cite">agent/prompt_builder.py:212</code>). The tool schema declares <code>patch</code> the preferred action; <code>edit</code> is for major overhauls only.</li>
+<li><strong>Foreground path</strong>: the live agent calls <code>skill_manage(action='patch', old_string, new_string)</code> on the skill it just used — a unique-match requirement guards it (<code class="cite">tools/skill_manager_tool.py:1069</code>).</li>
+<li><strong>Autonomous path</strong>: the end-of-turn fork re-reads the loaded skill with <code>skill_view</code>, then patches — only if the skill passes the ownership guards below.</li>
+<li>"Versioning" is a <strong>reuse-after-patch signal</strong> in telemetry: <code>bump_patch</code> increments <code>patch_generation</code>, and a subsequent successful use flips <code>reuse_after_patch</code> true, evidencing the improvement stuck (<code class="cite">tools/skill_usage.py:864</code>). Recoverability comes from the per-mutation ledger and pre-run tarball snapshots, not frontmatter versions.</li>
+</ul>
+</section>
+
+<section id="guards">
+<h2>The ownership guards — how the agent can only improve what it owns</h2>
+<p>The autonomous half prefers UPDATE over CREATE, made safe by five guards (<code class="cite">tools/skill_manager_tool.py:301</code>):</p>
+<ol>
+<li><strong>Ownership guard</strong> — no-op for foreground agents; for the fork it refuses, in order: pinned, external-dir, protected builtin, hub-installed, bundled, and finally not-curator-managed. A missing telemetry record and an explicit <code>created_by: null</code> resolve identically — otherwise "allowed exactly once" would be a race with the guard's own bookkeeping. The refusal names the escape hatch: <code>hermes curator adopt &lt;name&gt;</code>.</li>
+<li><strong>Read-before-write guard</strong> — the fork may only patch a path it actually <code>skill_view</code>'d this turn, never content inferred from the transcript (<code class="cite">tools/skill_manager_tool.py:424</code>).</li>
+<li><strong>Consolidation-delete guard</strong> — during a review/curator pass, <code>delete</code> requires a non-empty <code>absorbed_into=&lt;umbrella&gt;</code>; a past fail-open pass once archived whole clusters of active skills (<code class="cite">tools/skill_manager_tool.py:463</code>).</li>
+<li><strong>Delete → archive</strong>, never <code>rmtree</code>, during autonomous passes (recoverable <code>.archive/</code>).</li>
+<li><strong>Org-mirror guard</strong> — org-shared skills are editable (edits go to a personal mirror and reach the org via <code>hermes sync propose</code>) but not deletable. The docstring is the clearest statement of the whole philosophy: blocking every write "broke the learning loop exactly where it matters most" (<code class="cite">tools/skill_manager_tool.py:699</code>).</li>
+</ol>
+<p>Provenance is the mechanism underneath: a <code>ContextVar</code> set once per turn marks writes as <code>assistant_tool</code> vs <code>background_review</code>, so the curator only ever consolidates skills the agent autonomously created — a user-directed create gets <code>created_by: null</code> and belongs to the user (<code class="cite">tools/skill_provenance.py:3</code>).</p>
+</section>
+
+<section id="memory">
+<h2>Memory nudges</h2>
+<p><code>_turns_since_memory</code> increments per user turn, hydrates from persisted history on resume so a restart doesn't reset the clock, and at <code>memory.nudge_interval</code> (default 10) arms <code>should_review_memory</code> (<code class="cite">agent/turn_context.py:703</code>). The nudge is <strong>not</strong> injected into the conversation — the prologue explicitly preserves the original user message; the flag rides through to the finalizer, which spawns the same fork.</p>
+<p>The prompt (<code>_MEMORY_REVIEW_PROMPT</code>) is short: save persona/preferences/personal details and expectations about how the agent should behave (<code class="cite">agent/background_review.py:248</code>). Memory is <strong>two Markdown files</strong>, not SQLite: <code>~/.hermes/memories/MEMORY.md</code> (agent notes) and <code>USER.md</code> (user profile), delimited by <code>§</code>, bounded by <em>character</em> limits (<code class="cite">tools/memory_tool.py:53</code>). The load-bearing design is the <strong>frozen snapshot</strong>: files are injected at session start; mid-session writes update disk immediately (durable) but do not change the system prompt, preserving the prefix cache for the whole session (<code class="cite">tools/memory_tool.py:11</code>). Guidance draws a sharp line: reusable procedures belong in a <em>skill</em>, task progress belongs in <em>session search</em>, and memories must be declarative facts ("User prefers concise responses" ✓) not imperatives ("Always respond concisely" ✗).</p>
+</section>
+
+<section id="search">
+<h2>Session search / cross-session recall</h2>
+<p>Transcripts live in the SQLite state DB with an <strong>FTS5</strong> external-content index plus a <strong>trigram</strong> index for CJK/substring search (<code class="cite">hermes_state_common.py:483</code>). The agent-facing tool makes <strong>no LLM calls</strong> — every shape returns actual DB rows (<code class="cite">tools/session_search_tool.py:1128</code>): DISCOVERY (FTS with adaptive hydration of only the top hit), SCROLL (a window around a message), READ (a whole session), BROWSE (recent). Notable behaviors: cron sessions demoted below interactive results to fix "recall blindness" where a high-volume cron corpus starved user sessions under bare BM25; lineage dedup so compression continuations don't return the same conversation N times; and an explicit anti-hallucination clause forbidding "no prior correspondence" conclusions from search alone when a direct source was given.</p>
+<p>The "LLM summarization" lives adjacent, not in the search path: LLM-generated <strong>session titles</strong> (<code class="cite">agent/title_generator.py:74</code>) that are themselves searchable, plus compaction summaries written into the message stream and therefore FTS-indexed. <code>SESSION_SEARCH_GUIDANCE</code> tells the model to recall before asking the user to repeat themselves.</p>
+</section>
+
+<section id="honcho">
+<h2>Honcho dialectic user modeling</h2>
+<p>An optional external provider (<code class="cite">plugins/memory/honcho/__init__.py:262</code>) selected by <code>memory.provider</code>. Per turn: <code>on_turn_start</code> → <code>prefetch_all</code> (base context + a dialectic supplement, each on its own cadence) → the recalled text is composed into the <em>API copy</em> of the user message only, wrapped in a <code>&lt;memory-context&gt;</code> block marked "recalled memory context, NOT new user input", and stamped as <code>api_content</code> so it never enters the clean transcript → <code>sync_all</code> + <code>queue_prefetch_all</code> on a serialized background worker so a wedged provider can't stall the turn.</p>
+<p>The dialectic itself runs up to three <code>peer.chat()</code> passes — a cold/warm opening question, a self-audit ("what gaps remain?"), and a reconciliation ("do these cohere?") — bailing early on strong signal (<code class="cite">plugins/memory/honcho/__init__.py:1170</code>). It renders up to five blocks — Session Summary, User Representation, User Peer Card, AI Self-Representation, AI Identity Card — the literal "deepening model of who you are". The background review fork is built with <code>skip_memory=True</code> precisely so it never writes the harness prompt into the user's real Honcho namespace.</p>
+</section>
+
+<section id="curator">
+<h2>The curator — the slower library-level loop</h2>
+<p>Not a cron daemon — it is <em>polled</em> at CLI startup and in the gateway housekeeping loop (<code class="cite">agent/curator.py:1</code>). It runs when <code>curator.enabled</code> ∧ not paused ∧ <code>last_run_at</code> older than <code>interval_hours</code> (default 7 days), with an idle gate. Two passes:</p>
+<ul>
+<li><strong>Pass 1 — deterministic, no LLM.</strong> Walks usage: <code>active → stale</code> after 30 days idle, <code>→ archived</code> after 90, reactivating on re-use. Skips pinned, cron-referenced, and young-unused skills ("a use=0 skill is absence of evidence, not evidence of staleness") (<code class="cite">agent/curator.py:305</code>).</li>
+<li><strong>Pass 2 — LLM consolidation, OFF by default</strong> (<code>curator.consolidate: False</code>). When on, it forks an agent with the <code>CURATOR_REVIEW_PROMPT</code> (<code class="cite">agent/curator.py:432</code>) to build umbrella skills — cluster prefix-related skills, merge into or create umbrellas, demote narrow siblings to <code>references/</code>. "One broad umbrella skill with labeled subsections beats five narrow siblings for discoverability." It requires a structured YAML summary listing every archived skill, reconciled against what actually happened on disk, with a pre-run tarball snapshot as a safety net.</li>
+</ul>
+<p>The <code>adopt</code> CLI is the documented escape hatch the refusals point at, and its own docstring explains why adoption can never be automatic: <em>"a high patch count proves the agent MAINTAINS a skill, not that it AUTHORED it"</em> (<code class="cite">hermes_cli/curator.py:344</code>). The <code>plan</code> skill is a protected builtin, exempt on every path.</p>
+</section>
+
+<section id="caveats">
+<h2>Honest caveats for the reader</h2>
+<ul>
+<li><strong>Nudges are counters, not prompt injections</strong> — the live conversation never sees them.</li>
+<li><strong>LLM consolidation is off by default</strong> — out of the box a curator run does only the deterministic prune; the dramatic curator prompt runs only when opted in.</li>
+<li><strong>No embeddings anywhere</strong> in skill routing — 60-char descriptions + frontmatter filters. FTS5 is keyword/BM25/trigram, not vector.</li>
+<li><strong>"LLM summarization" for session search</strong> = LLM-generated session titles + indexed compaction summaries; the search tool makes no LLM calls.</li>
+<li><strong>Skill "versioning"</strong> is telemetry + ledger + tarball snapshots, not semver frontmatter.</li>
+<li><code>hermes_cli/curator.py</code> curates <em>skills</em>, not memory; memory consolidation is forced by the char limit and done by the model in-band.</li>
+</ul>
+</section>
+    </main>
+  </div>
+  <footer>
+    Hermes Agent fresh wiki · grounded 2026-08-19 against commit <code>42a4c91c4</code>
+    for <code>IgorTavcar/hermes-agent</code> (fork of <code>NousResearch/hermes-agent</code>);
+    citations are <code>path:line</code> into the working tree; diagrams render offline via vendored mermaid.
+  </footer>
+  <script>
+    const links = [...document.querySelectorAll('.sidebar a')];
+    const map = new Map(links.map(a => [a.getAttribute('href').slice(1), a]));
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          links.forEach(a => a.classList.remove('active'));
+          const a = map.get(e.target.id);
+          if (a) a.classList.add('active');
+        }
+      });
+    }, { rootMargin: '-80px 0px -70% 0px' });
+    document.querySelectorAll('main section[id]').forEach(s => obs.observe(s));
+  </script>
+</body>
+</html>

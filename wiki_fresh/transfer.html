@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Transferable Ideas · Hermes Fresh Wiki</title>
+  <link rel="stylesheet" href="./style.css">
+  <script defer src="./search-index.js"></script>
+  <script defer src="./wiki.js"></script>
+  <script src="./vendor/mermaid.min.js"></script>
+  <script>
+    window.addEventListener("DOMContentLoaded", function () {
+      if (!window.mermaid) return;
+      try {
+        mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "loose",
+          themeVariables: { fontFamily: "ui-monospace, monospace", fontSize: "13px",
+            primaryColor: "#171b24", primaryBorderColor: "#2d3543", primaryTextColor: "#e7ebf2",
+            lineColor: "#c9a93a", secondaryColor: "#12151c", tertiaryColor: "#0a0c10" } });
+        mermaid.run({ querySelector: "pre.mermaid" });
+      } catch (e) { console.error("mermaid render failed", e); }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="index.html"><span class="mark">☤</span> Hermes Agent <span class="sub">Fresh Wiki</span></a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="loops.html">Turn Loops</a>
+      <a href="kernels.html">LLM Kernels</a>
+      <a href="providers.html">Providers &amp; Tiers</a>
+      <a href="channels.html">Channels</a>
+      <a href="skills.html">Self-Adaptive Skills</a>
+      <a href="transfer.html" class="active">Transferables</a>
+    </nav>
+  </header>
+  <div class="layout">
+    <aside class="sidebar">
+      <p class="toc-title">On this page</p>
+      <ul>
+        <li><a href="#thesis">The recurring thesis</a></li>
+        <li><a href="#context">Protecting the context window</a></li>
+        <li><a href="#rate">Surviving real rate limits</a></li>
+        <li><a href="#concurrency">Concurrency &amp; identity</a></li>
+        <li><a href="#learning">The learning loop</a></li>
+        <li><a href="#safety">Safety &amp; trust boundaries</a></li>
+        <li><a href="#serverless">Serverless persistence</a></li>
+        <li><a href="#pick">What to lift first</a></li>
+      </ul>
+    </aside>
+    <main>
+<div class="hero">
+<h1 class="page-title">Transferable Ideas</h1>
+<p class="lead">This page is the "what can be transferred" index: the best methods, algorithms and hard-won know-how in Hermes that generalize to any serious agent harness, regardless of framework. Each item names the idea, the concrete problem it solves, and the file to read. The recurring theme is that the non-obvious win is almost always about protecting the model's context window, surviving real-world rate limits, or making stateless infrastructure behave like stateful shells.</p>
+</div>
+
+<section id="thesis">
+<h2>The recurring thesis</h2>
+<p>Read enough of the codebase and one pattern dominates: the clever code is not about model orchestration, it is about defending three scarce resources. Almost every non-obvious design choice traces back to one of them.</p>
+<table class="grid">
+<thead><tr><th>Scarce resource</th><th>What breaks without care</th><th>Where Hermes defends it</th></tr></thead>
+<tbody>
+<tr><td>Context window</td><td>tool outputs bloat the prompt; compaction thrashes; caches break</td><td>RPC tool calls, structured compaction, cache-stable serialization</td></tr>
+<tr><td>Rate / tier quota</td><td>SDK double-retries, credential races, one 429 stalls the fleet</td><td>owned retry loop, single-use-token flocks, credential pool</td></tr>
+<tr><td>Stateless infra</td><td>serverless sandboxes lose the filesystem between turns</td><td>filesystem-snapshot persistence, self-suspend, wake</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="context">
+<h2>Protecting the context window</h2>
+<table class="grid">
+<thead><tr><th>Idea</th><th>Problem solved</th><th>Read</th></tr></thead>
+<tbody>
+<tr><td><strong>RPC zero-context tool calls (<code>execute_code</code>)</strong></td><td>The model writes a Python script that calls real tools over an RPC stub, so a 50-call pipeline costs <em>one</em> inference turn and intermediate outputs never enter context. The iteration is even refunded to the budget.</td><td><code class="cite">tools/code_execution_tool.py:652</code></td></tr>
+<tr><td><strong>Compression uses prompt tokens only</strong></td><td>Reasoning tokens inflate completion counts and caused premature compaction. Always trigger on the provider's real prompt count, with a schema-inclusive rough estimate as fallback (50+ tools add 20–30K tokens).</td><td><code class="cite">agent/conversation_loop.py:7305</code></td></tr>
+<tr><td><strong>Rearm compaction only on confirmed recovery</strong></td><td>A completed compaction clears the attempt budget only when the very next request's real prompt count proves it dropped below threshold — not optimistically.</td><td><code class="cite">agent/conversation_loop.py:4021</code></td></tr>
+<tr><td><strong>Information-bearing compaction</strong></td><td>Replace old tool outputs with typed one-liners (not dumb placeholders), dedup identical results by content hash, and repair orphaned tool_call/result pairs so the provider never 400s.</td><td><code class="cite">agent/context_compressor.py:1848</code></td></tr>
+<tr><td><strong>Frozen memory snapshot</strong></td><td>Memory files are injected at session start; mid-session writes hit disk immediately but do <em>not</em> change the system prompt, preserving the KV-cache prefix for the whole session.</td><td><code class="cite">tools/memory_tool.py:11</code></td></tr>
+<tr><td><strong>Cache-stable serialization</strong></td><td>Re-serialize tool-call JSON with <code>sort_keys=True</code> and tight separators every call, keeping the prompt prefix byte-identical so local KV-caches (vLLM, llama.cpp, Ollama) stay warm.</td><td><code class="cite">agent/prompt_caching.py:385</code></td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="rate">
+<h2>Surviving real rate limits</h2>
+<table class="grid">
+<thead><tr><th>Idea</th><th>Problem solved</th><th>Read</th></tr></thead>
+<tbody>
+<tr><td><strong>Own the retry loop; disable SDK retries</strong></td><td>Every SDK's <code>max_retries=0</code>, because the SDK default ignores <code>Retry-After</code> and double-retries inside your own loop. All backoff, rotation and fallback live in one place.</td><td><code class="cite">run_agent.py:5331</code></td></tr>
+<tr><td><strong>Distinguish account-429 from capacity-429</strong></td><td>Inspect the 429's own <code>x-ratelimit-*</code> headers: an account-level limit needs backoff or credential rotation, an upstream-capacity limit needs a plain retry.</td><td><code class="cite">agent/conversation_loop.py:5347</code></td></tr>
+<tr><td><strong>Single-use refresh-token flock</strong></td><td>Codex and xAI rotate refresh tokens on use; wrap refresh in a cross-process <code>auth.json</code> flock and re-read the live store first so two processes don't burn each other's token.</td><td><code class="cite">agent/credential_pool.py:1313</code></td></tr>
+<tr><td><strong>Credential pool with rotation strategies</strong></td><td>Multiple accounts per provider (<code>fill_first | round_robin | random | least_used</code>), rotated before falling back to a different model — so one exhausted subscription doesn't stop the agent.</td><td><code class="cite">agent/credential_pool.py:164</code></td></tr>
+<tr><td><strong>Banked quota reset</strong></td><td>Model the provider's own "restore full limits" credit, and refuse to spend it when the busiest window isn't near full — spending early wastes most of it.</td><td><code class="cite">agent/account_usage.py:587</code></td></tr>
+<tr><td><strong>Always-stream health checks</strong></td><td>Prefer streaming even with no consumer, purely to gain the 90s stale-stream and 60s read-timeout detectors the non-streaming path lacks; repackage into a non-streaming shape so the loop never notices.</td><td><code class="cite">agent/chat_completion_helpers.py:3833</code></td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="concurrency">
+<h2>Concurrency &amp; identity in a multi-tenant process</h2>
+<table class="grid">
+<thead><tr><th>Idea</th><th>Problem solved</th><th>Read</th></tr></thead>
+<tbody>
+<tr><td><strong>Routing identity in ContextVars, copied at every thread boundary</strong></td><td>Concurrent gateway messages were overwriting each other's <code>os.environ</code> routing identity. Move identity into <code>ContextVar</code>s with a <code>_UNSET</code> sentinel distinguishing "never set" from "explicitly cleared", and copy the context at every hand-off. One of the cleanest fixes in the repo.</td><td><code class="cite">gateway/session_context.py:11</code></td></tr>
+<tr><td><strong>Turn lease on the resolved session_id</strong></td><td>Serialize turns on the <em>resolved</em> id, not the routing key, so two keys mapping to one session can't run concurrently. Fail closed on timeout.</td><td><code class="cite">gateway/turn_lease.py:191</code></td></tr>
+<tr><td><strong>Clear the guard, never delete it</strong></td><td>On drain, <code>.clear()</code> the per-session Event but never delete the entry — deleting admits a second concurrent agent on the same key.</td><td><code class="cite">gateway/platforms/base.py:6768</code></td></tr>
+<tr><td><strong>Tail-recurse the turn chain, but hand off via fresh tasks</strong></td><td>Follow-ups recurse with a depth cap (3); the adapter-level drain spawns a <em>fresh task</em> rather than awaiting, because the await chain grew one C-stack frame per follow-up and segfaulted at ~2000.</td><td><code class="cite">gateway/platforms/base.py:6765</code></td></tr>
+<tr><td><strong>Daemon pools + detach wedged workers</strong></td><td>Tool workers run on a daemon pool (a wedged non-daemon thread blocks interpreter exit); on abandon, <code>shutdown(wait=False, cancel_futures=True)</code> leaves a hung tool detached rather than deadlocking the batch.</td><td><code class="cite">agent/tool_executor.py:1622</code></td></tr>
+<tr><td><strong>Start-order gate under parallel execution</strong></td><td>Serialize <em>dispatch</em> by submit order even though execution is parallel, so approval prompts appear in order — with a bounded timeout that proceeds out of order rather than starving.</td><td><code class="cite">agent/tool_executor.py:1200</code></td></tr>
+<tr><td><strong>Steer vs redirect vs interrupt</strong></td><td>Three distinct escalation verbs: steer never kills anything, redirect aborts only the model request (degrading to steer while tools run), interrupt kills request + tools + children. Interrupt is demoted to queue while subagents or compression are in flight.</td><td><code class="cite">gateway/run.py:10112</code></td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="learning">
+<h2>The closed learning loop</h2>
+<table class="grid">
+<thead><tr><th>Idea</th><th>Problem solved</th><th>Read</th></tr></thead>
+<tbody>
+<tr><td><strong>Complexity = tool-iteration count</strong></td><td>Operationalize "this task was hard, save a skill" as ≥N tool iterations since the last skill write — a cheap, robust proxy that needs no classifier.</td><td><code class="cite">agent/turn_finalizer.py:770</code></td></tr>
+<tr><td><strong>Out-of-band review fork</strong></td><td>Do self-improvement in a forked agent with <code>_persist_disabled</code> so the harness prompt never enters the user's real session (the "agent becomes the curator" bug). Inherit the cached system prompt for a warm cache. Cancel the prior fork before starting a new one.</td><td><code class="cite">agent/background_review.py:860</code></td></tr>
+<tr><td><strong>Provenance-gated self-editing</strong></td><td>A per-turn ContextVar marks writes as user-directed vs autonomous, so the curator only ever mutates skills the agent authored — user skills stay the user's. Missing record and explicit <code>null</code> resolve identically to avoid a race with your own bookkeeping.</td><td><code class="cite">tools/skill_provenance.py:3</code></td></tr>
+<tr><td><strong>Read-before-write for autonomous edits</strong></td><td>The review fork may only patch content it actually loaded this turn, never content inferred from the transcript.</td><td><code class="cite">tools/skill_manager_tool.py:424</code></td></tr>
+<tr><td><strong>Anti-sediment capture rules</strong></td><td>Explicitly refuse to persist environment-dependent failures and negative tool claims — they "harden into refusals the agent cites against itself for months after the actual problem was fixed."</td><td><code class="cite">agent/background_review.py:332</code></td></tr>
+<tr><td><strong>Umbrella-building curator</strong></td><td>A slow, polled consolidation pass that clusters narrow skills into class-level umbrellas — treating "hundreds of one-session skills" as a library failure, not a feature. Off by default; deterministic aging always on.</td><td><code class="cite">agent/curator.py:432</code></td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="safety">
+<h2>Safety &amp; trust boundaries</h2>
+<table class="grid">
+<thead><tr><th>Idea</th><th>Problem solved</th><th>Read</th></tr></thead>
+<tbody>
+<tr><td><strong>Untrusted output framed as data</strong></td><td>Wrap results from web/browser/MCP tools in semantic delimiters marking them "data, not instructions", at one chokepoint — the architectural defense against indirect prompt injection — and teach the model a one-shot freshness rule for the trusted steer marker.</td><td><code class="cite">agent/tool_dispatch_helpers.py:534</code></td></tr>
+<tr><td><strong>Never serialize raw chain-of-thought</strong></td><td>Inlining an assistant's own CoT into replayable content reads to provider classifiers as a prefill jailbreak and bricks the session with deterministic empty-response storms. Keep interrupt scaffold text out of assistant content too.</td><td><code class="cite">agent/conversation_loop.py:268</code></td></tr>
+<tr><td><strong>Persist before side effects</strong></td><td>Flush the assistant tool-call row to SQLite before any tool executes — a destructive tool can restart the process, and resume logic must see the exact block that ran. A flush failure aborts the turn rather than executing from process-local state.</td><td><code class="cite">agent/conversation_loop.py:7161</code></td></tr>
+<tr><td><strong>Socket-shutdown, not client-close, from stranger threads</strong></td><td>A watchdog must never <code>close()</code> a client whose TLS socket another thread is reading; strangers only <code>shutdown(SHUT_RDWR)</code>, owners do the SDK close — closing a real memory-corruption class.</td><td><code class="cite">run_agent.py:5429</code></td></tr>
+<tr><td><strong>Auxiliary-LLM approval guardian</strong></td><td>A guardian LLM inside the approval gate triages approve/deny/escalate before a human is bothered — borrowed from Codex's Smart Approvals.</td><td><code class="cite">tools/approval.py:991</code></td></tr>
+<tr><td><strong>Toolset intersection for subagents</strong></td><td>A child's toolset is inherited and intersected, never expanded — a subagent must not gain tools the parent lacks — and leaf children lose the delegation tool entirely.</td><td><code class="cite">tools/delegate_tool.py:1660</code></td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="serverless">
+<h2>Making stateless infra behave statefully</h2>
+<table class="grid">
+<thead><tr><th>Idea</th><th>Problem solved</th><th>Read</th></tr></thead>
+<tbody>
+<tr><td><strong>Filesystem-snapshot persistence</strong></td><td>Serverless sandboxes (Modal, Daytona) lose the filesystem between turns; snapshot on cleanup and restore next session to fake persistence on hibernating sandboxes.</td><td>Internals report</td></tr>
+<tr><td><strong>Self-suspend, don't trust the proxy</strong></td><td>The gateway self-suspends via the Fly Machines socket because the Fly proxy judges idleness on inbound connections only and cannot see an in-flight turn.</td><td><code class="cite">gateway/scale_to_zero.py:1</code></td></tr>
+<tr><td><strong>Push-or-self-POST wake</strong></td><td>Push-capable adapters wake via a synthetic internal event; stateless adapters get a self-POST carrying the raw session id, because a derived key would land the wake in an invisible parallel session.</td><td><code class="cite">gateway/wake.py:1</code></td></tr>
+<tr><td><strong>Idle-based timeouts, not wall-clock</strong></td><td>The watchdog fires on <em>idle</em> seconds, so a legitimately busy multi-hour turn is never killed — activity is stamped at every meaningful point in the loop.</td><td><code class="cite">gateway/run.py:3320</code></td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="pick">
+<h2>What to lift first</h2>
+<p>If you are building your own harness and want the highest-leverage ideas per unit of effort:</p>
+<ol>
+<li><strong>RPC tool calls (<code>execute_code</code>)</strong> — the single biggest context-window win; collapses multi-step pipelines to one turn.</li>
+<li><strong>Own your retry loop, disable the SDK's</strong> — a small change that fixes the most common production failure (double-retried 429s that ignore <code>Retry-After</code>).</li>
+<li><strong>ContextVar routing identity with copies at every thread boundary</strong> — the correct answer to multi-tenant agent identity leaks.</li>
+<li><strong>Persist-before-side-effects + one-result-per-tool-call</strong> — the invariants that make resume and provider replay actually work.</li>
+<li><strong>Untrusted-output-as-data framing</strong> — the cheapest meaningful defense against indirect prompt injection.</li>
+<li><strong>Out-of-band review fork with <code>_persist_disabled</code></strong> — if you want a learning loop, this is the structural trick that keeps it from poisoning the live session.</li>
+</ol>
+<div class="callout key"><strong>The meta-lesson.</strong> Nearly every citation on this page is accompanied in the source by a comment naming a specific bug number and the failure it caused. The transferable asset is not just the code — it is the catalog of failure modes a production agent hits, and the minimal invariant that closes each one.</div>
+</section>
+    </main>
+  </div>
+  <footer>
+    Hermes Agent fresh wiki · grounded 2026-08-19 against commit <code>42a4c91c4</code>
+    for <code>IgorTavcar/hermes-agent</code> (fork of <code>NousResearch/hermes-agent</code>);
+    citations are <code>path:line</code> into the working tree; diagrams render offline via vendored mermaid.
+  </footer>
+  <script>
+    const links = [...document.querySelectorAll('.sidebar a')];
+    const map = new Map(links.map(a => [a.getAttribute('href').slice(1), a]));
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          links.forEach(a => a.classList.remove('active'));
+          const a = map.get(e.target.id);
+          if (a) a.classList.add('active');
+        }
+      });
+    }, { rootMargin: '-80px 0px -70% 0px' });
+    document.querySelectorAll('main section[id]').forEach(s => obs.observe(s));
+  </script>
+</body>
+</html>

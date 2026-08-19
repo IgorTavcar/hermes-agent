@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Messaging Channels · Hermes Fresh Wiki</title>
+  <link rel="stylesheet" href="./style.css">
+  <script defer src="./search-index.js"></script>
+  <script defer src="./wiki.js"></script>
+  <script src="./vendor/mermaid.min.js"></script>
+  <script>
+    window.addEventListener("DOMContentLoaded", function () {
+      if (!window.mermaid) return;
+      try {
+        mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "loose",
+          themeVariables: { fontFamily: "ui-monospace, monospace", fontSize: "13px",
+            primaryColor: "#171b24", primaryBorderColor: "#2d3543", primaryTextColor: "#e7ebf2",
+            lineColor: "#c9a93a", secondaryColor: "#12151c", tertiaryColor: "#0a0c10" } });
+        mermaid.run({ querySelector: "pre.mermaid" });
+      } catch (e) { console.error("mermaid render failed", e); }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="index.html"><span class="mark">☤</span> Hermes Agent <span class="sub">Fresh Wiki</span></a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="loops.html">Turn Loops</a>
+      <a href="kernels.html">LLM Kernels</a>
+      <a href="providers.html">Providers &amp; Tiers</a>
+      <a href="channels.html" class="active">Channels</a>
+      <a href="skills.html">Self-Adaptive Skills</a>
+      <a href="transfer.html">Transferables</a>
+    </nav>
+  </header>
+  <div class="layout">
+    <aside class="sidebar">
+      <p class="toc-title">On this page</p>
+      <ul>
+        <li><a href="#plug">How a channel plugs in</a></li>
+        <li><a href="#authz">Authorization &amp; pairing</a></li>
+        <li><a href="#crosscut">Cross-cutting handling</a></li>
+        <li><a href="#telegram">Telegram</a></li>
+        <li><a href="#whatsapp-baileys">WhatsApp (Baileys)</a></li>
+        <li><a href="#whatsapp-cloud">WhatsApp (Cloud API)</a></li>
+        <li><a href="#twilio">Twilio SMS</a></li>
+        <li><a href="#others">Discord / Slack / Signal</a></li>
+        <li><a href="#commands">CLI reference</a></li>
+      </ul>
+    </aside>
+    <main>
+<div class="hero">
+<h1 class="page-title">Messaging Channels</h1>
+<p class="lead">One gateway process fronts every chat platform. Each channel is a platform adapter — a subclass of <code>BasePlatformAdapter</code> that normalizes inbound platform updates into a <code>MessageEvent</code> and sends replies back out. This page covers the quickest, cleanest setup for Telegram, WhatsApp (both the unofficial Baileys bridge and the official Meta Cloud API), and Twilio SMS, with the real config keys, plus a briefer tour of Discord, Slack and Signal.</p>
+</div>
+
+<section id="plug">
+<h2>How a channel plugs into the gateway</h2>
+<p>Adapters subclass <code>BasePlatformAdapter</code> and register through a plugin's <code>register(ctx)</code> → <code>ctx.register_platform(...)</code> (<code class="cite">hermes_cli/plugins.py:2774</code>), which builds a <code>PlatformEntry</code> in the <code>PlatformRegistry</code> (<code class="cite">gateway/platform_registry.py:62</code>). Heavy SDKs (python-telegram-bot, discord.py, slack_bolt) are <strong>lazy-loaded</strong> — a deferred loader per platform imports the SDK only when the registry is queried (<code class="cite">hermes_cli/plugins.py:4437</code>). At startup <code>GatewayRunner._create_adapter()</code> checks the registry first, then falls through to a built-in <code>if/elif</code> chain (<code class="cite">gateway/run.py:15560</code>).</p>
+<p><strong>Enablement is env-driven</strong> — the mere presence of a token enables the channel (<code class="cite">gateway/config.py:1910</code> ff.): Telegram on <code>TELEGRAM_BOT_TOKEN</code>, WhatsApp/Baileys on <code>WHATSAPP_ENABLED</code>, WhatsApp Cloud on the phone-id + access-token pair, SMS/Twilio on <code>TWILIO_ACCOUNT_SID</code>. YAML config in <code>~/.hermes/config.yaml</code> is bridged into these env vars by each plugin's <code>apply_yaml_config</code> hook.</p>
+</section>
+
+<section id="authz">
+<h2>Authorization &amp; pairing — one shared gate</h2>
+<p><code>GatewayRunner._is_user_authorized()</code> (<code class="cite">gateway/authz_mixin.py:386</code>) applies one ordered policy across every channel: chat-scoped group allowlists → <code>{PLATFORM}_ALLOW_BOTS</code> → per-platform allow-all → the pairing store → env allowlists <code>{PLATFORM}_ALLOWED_USERS</code> + <code>GATEWAY_ALLOWED_USERS</code> → <strong>default deny</strong>. The global escape hatch is <code>GATEWAY_ALLOW_ALL_USERS</code>.</p>
+<p>The zero-config path is <strong>DM pairing</strong>: leave the allowlist unset, and an unknown DM gets a pairing code the operator approves with <code>hermes pairing approve &lt;platform&gt; &lt;code&gt;</code> — approval also writes the user into the platform's allowlist env var (<code class="cite">gateway/pairing.py:1</code>).</p>
+</section>
+
+<section id="crosscut">
+<h2>Cross-cutting message handling</h2>
+<ul>
+<li><strong>Chunking</strong>: <code>truncate_message()</code> splits at natural boundaries, preserves/re-opens code fences, and appends <code>(1/3)</code> indicators; a <code>len_fn</code> lets Telegram measure in UTF-16 units (<code class="cite">gateway/platforms/base.py:7188</code>).</li>
+<li><strong>Typing</strong>: a <code>_keep_typing()</code> heartbeat refreshes every 2&nbsp;s (<code class="cite">gateway/platforms/base.py:5104</code>).</li>
+<li><strong>Voice memos</strong>: gateway-side and provider-agnostic — <code>_enrich_message_with_transcription()</code> transcribes inbound audio and prepends it as quoted lines, optionally echoing <code>🎙️ "…"</code> back to the chat (<code class="cite">gateway/run.py:24367</code>).</li>
+<li><strong>Cross-platform continuity</strong>: sessions are keyed <em>per platform</em> — there is no automatic shared session across platforms. The three bridges are <code>/handoff &lt;platform&gt;</code> (moves a live session keeping its id), the <code>send_message</code> tool with <code>target="&lt;platform&gt;:&lt;chat_id&gt;"</code>, and delivery mirroring into the target session's transcript (<code class="cite">gateway/mirror.py:25</code>).</li>
+</ul>
+</section>
+
+<section id="telegram">
+<h2>Telegram</h2>
+<p>The most feature-complete adapter (~10.9k lines): <code>TelegramAdapter</code> over <strong>python-telegram-bot 22.8</strong> (<code class="cite">plugins/platforms/telegram/adapter.py:638</code>). Inbound is <strong>long polling by default</strong>, or webhook when <code>TELEGRAM_WEBHOOK_URL</code> is set — and webhook mode <em>refuses to start</em> without <code>TELEGRAM_WEBHOOK_SECRET</code> (<code class="cite">plugins/platforms/telegram/adapter.py:4640</code>). Outbound sends MarkdownV2 with an automatic plain-text fallback when Telegram reports a parse error (<code class="cite">plugins/platforms/telegram/adapter.py:5255</code>); the 4096-char limit is measured in UTF-16 code units. Voice memos route through the gateway STT pipeline; photos are cached locally so vision tools survive Telegram's ~1h ephemeral URLs.</p>
+<div class="callout key"><strong>Quickest setup.</strong>
+<ol>
+<li><strong>Automatic (recommended)</strong>: <code>hermes setup</code> → Telegram → choice [1] does QR-based managed-bot onboarding through a Nous-hosted service and auto-detects your user id (<code class="cite">hermes_cli/telegram_managed_bot.py:21</code>). <strong>Manual</strong>: <code>/newbot</code> in @BotFather for the token; message @userinfobot for your numeric id.</li>
+<li>Write <code>~/.hermes/.env</code>: <code>TELEGRAM_BOT_TOKEN=…</code>, <code>TELEGRAM_ALLOWED_USERS=&lt;your id&gt;</code>, <code>TELEGRAM_HOME_CHANNEL=&lt;your id&gt;</code> (cron/notification target). Or leave <code>ALLOWED_USERS</code> unset and use pairing.</li>
+<li>For groups: disable BotFather privacy mode <em>and re-add the bot</em>.</li>
+<li><code>hermes gateway</code> → expect <code>[telegram] Connected to Telegram (polling mode)</code>.</li>
+<li>Webhook mode (cloud/sleep-when-idle): add <code>TELEGRAM_WEBHOOK_URL</code> and <code>TELEGRAM_WEBHOOK_SECRET="$(openssl rand -hex 32)"</code>.</li>
+</ol>
+</div>
+</section>
+
+<section id="whatsapp-baileys">
+<h2>WhatsApp via Baileys bridge (unofficial, personal accounts)</h2>
+<p><code>WhatsAppAdapter</code> does <em>not</em> speak the WhatsApp protocol — it manages a Node.js sidecar (<strong>Baileys</strong> <code>@whiskeysockets/baileys</code>) and talks HTTP to <code>127.0.0.1:&lt;bridge_port&gt;</code> (<code class="cite">plugins/platforms/whatsapp/adapter.py:381</code>, bridge at <code class="cite">scripts/whatsapp-bridge/bridge.js:1</code>). Inbound is <strong>1-second HTTP polling</strong> of the local bridge's <code>/messages</code> (<code class="cite">plugins/platforms/whatsapp/adapter.py:1326</code>); outbound is one <code>POST /send</code> per chunk. Pairing is by QR against WhatsApp's Linked Devices; the bridge serializes all sends to avoid cross-chat contamination.</p>
+<div class="callout key"><strong>Quickest setup.</strong>
+<ol>
+<li>Prereq: Node.js 18+.</li>
+<li><code>hermes whatsapp</code> — choose mode (separate bot number vs personal self-chat), enter <code>WHATSAPP_ALLOWED_USERS</code> (country-code phone numbers, no <code>+</code>; <code>*</code> = anyone), then scan the terminal QR: <strong>WhatsApp → Settings → Linked Devices → Link a Device</strong> (<code class="cite">hermes_cli/main.py:3257</code>). Only after <code>creds.json</code> exists does it write <code>WHATSAPP_ENABLED=true</code> — a deliberate choice so an aborted wizard doesn't cost a 30&nbsp;s gateway timeout.</li>
+<li>Alternative: pair from the web dashboard (streams QR frames).</li>
+<li><code>hermes gateway</code>.</li>
+</ol>
+</div>
+<div class="callout warn">Unofficial API — ban risk. Use a dedicated number.</div>
+</section>
+
+<section id="whatsapp-cloud">
+<h2>WhatsApp Business Cloud API (official Meta)</h2>
+<p><code>WhatsAppCloudAdapter</code> is built-in and talks <strong>raw HTTPS to the Meta Graph API</strong> via httpx, with an aiohttp webhook server for inbound (<code class="cite">gateway/platforms/whatsapp_cloud.py:203</code>). Inbound is a <strong>webhook</strong>: a GET verify handshake plus a POST handler that validates the <code>X-Hub-Signature-256</code> HMAC over the raw bytes and <em>refuses with 503 when <code>WHATSAPP_CLOUD_APP_SECRET</code> is unset</em> — the #1 "inbound doesn't work" cause (<code class="cite">gateway/platforms/whatsapp_cloud.py:1457</code>). Typing + read receipt ship in one call (Meta couples them), and interactive button/list replies are supported. Note: free-form sends only within Meta's 24-hour window; groups not supported in v1.</p>
+<div class="callout key"><strong>Quickest setup.</strong>
+<ol>
+<li>Meta side: create an app → WhatsApp → API Setup → generate access token.</li>
+<li><code>hermes whatsapp-cloud</code> — six validated prompts (<code class="cite">hermes_cli/setup_whatsapp_cloud.py:232</code>): <code>WHATSAPP_CLOUD_PHONE_NUMBER_ID</code> (Meta's 15–17 digit id, <em>not</em> the phone number — the #1 trap), <code>ACCESS_TOKEN</code> (<code>EAA…</code>), <code>APP_SECRET</code> (32 hex), and an auto-generated <code>VERIFY_TOKEN</code>.</li>
+<li>Expose HTTPS: <code>cloudflared tunnel --url http://localhost:8090</code>.</li>
+<li><code>hermes gateway</code>, then verify locally with a <code>curl</code> of the <code>hub.challenge</code> handshake before touching Meta.</li>
+<li>In Meta's dashboard set the callback URL <code>&lt;tunnel&gt;/whatsapp/webhook</code> + verify token, subscribe to the <code>messages</code> field, and add your phone to the recipient list.</li>
+</ol>
+</div>
+</section>
+
+<section id="twilio">
+<h2>Twilio SMS</h2>
+<p><code>SmsAdapter</code> uses <strong>no Twilio SDK</strong> — raw REST over aiohttp with HTTP Basic auth (<code class="cite">plugins/platforms/sms/adapter.py:81</code>). Inbound is a <strong>webhook</strong> (Twilio POSTs form-encoded); the handler validates the <code>X-Twilio-Signature</code> HMAC-SHA1 (trying both with-port and without-port URL variants, since Twilio may sign either) and <em>refuses to start</em> without <code>SMS_WEBHOOK_URL</code> unless <code>SMS_INSECURE_NO_SIGNATURE=true</code> (<code class="cite">plugins/platforms/sms/adapter.py:322</code>). Replies go out via the Twilio REST <code>Messages.json</code> API, not inline TwiML. Markdown is stripped (SMS renders it literally), the limit is 1600 chars (~10 segments), phone numbers are redacted in all logs, and MMS/media is not implemented.</p>
+<div class="callout key"><strong>Quickest setup.</strong>
+<ol>
+<li>Twilio Console: copy Account SID (<code>AC…</code>), Auth Token, and an SMS-capable number in E.164.</li>
+<li><code>uv pip install -e ".[sms]"</code> (installs aiohttp).</li>
+<li><code>~/.hermes/.env</code>: <code>TWILIO_ACCOUNT_SID</code>, <code>TWILIO_AUTH_TOKEN</code>, <code>TWILIO_PHONE_NUMBER=+1…</code>, and <code>SMS_WEBHOOK_URL=https://your-host/webhooks/twilio</code> (required), plus <code>SMS_ALLOWED_USERS</code>.</li>
+<li>Expose the port: <code>cloudflared tunnel --url http://localhost:8080</code>.</li>
+<li>Twilio Console → your number → Messaging → "A message comes in" → Webhook POST to <code>&lt;public&gt;/webhooks/twilio</code>. This URL must byte-match <code>SMS_WEBHOOK_URL</code> or every request fails signature validation.</li>
+<li><code>hermes gateway</code>.</li>
+</ol>
+</div>
+<div class="callout warn"><strong>Known bug (found during this survey).</strong> The SMS adapter's out-of-process sender (<code>_standalone_send</code>, used by cron <code>deliver=sms</code> and <code>send_message</code> without a live gateway) calls <code>_strip_markdown_for_sms()</code>, which uses <code>re.sub</code> but the module never imports <code>re</code> — so those paths raise <code>NameError</code> and return an error (<code class="cite">plugins/platforms/sms/adapter.py:437</code>). The live-adapter path is unaffected because it uses <code>helpers.strip_markdown</code> instead. Worth a one-line <code>import re</code> fix.</div>
+</section>
+
+<section id="others">
+<h2>Discord / Slack / Signal (brief)</h2>
+<table class="grid">
+<thead><tr><th>Channel</th><th>Library / transport</th><th>Inbound</th><th>Key env</th></tr></thead>
+<tbody>
+<tr><td><strong>Discord</strong></td><td><code>discord.py[voice] 2.7.1</code></td><td>gateway websocket (<code class="cite">plugins/platforms/discord/adapter.py:1267</code>)</td><td><code>DISCORD_BOT_TOKEN</code>, <code>DISCORD_ALLOWED_USERS</code>, <code>DISCORD_HOME_CHANNEL</code>; 2000-char limit</td></tr>
+<tr><td><strong>Slack</strong></td><td><code>slack-bolt</code> in Socket Mode</td><td><code>AsyncSocketModeHandler.start_async()</code> (<code class="cite">plugins/platforms/slack/adapter.py:1228</code>)</td><td><code>SLACK_BOT_TOKEN</code> (<code>xoxb-</code>), <code>SLACK_APP_TOKEN</code> (<code>xapp-</code>); <code>hermes slack manifest</code> generates the app manifest</td></tr>
+<tr><td><strong>Signal</strong></td><td><code>signal-cli</code> daemon; SSE inbound, JSON-RPC outbound</td><td>SSE stream from the local daemon (<code class="cite">gateway/platforms/signal.py:254</code>)</td><td><code>SIGNAL_HTTP_URL</code>, <code>SIGNAL_ACCOUNT</code>, <code>SIGNAL_ALLOWED_USERS</code></td></tr>
+</tbody>
+</table>
+<p>Beyond these, the repo ships plugin adapters for a2a, dingtalk, email, feishu, google_chat, homeassistant, irc, line, matrix, mattermost, ntfy, iMessage (photon/bluebubbles), teams, wecom and more, plus an experimental generic <a href="architecture.html#other-shapes">Relay adapter</a> that fronts many platforms through one connector.</p>
+</section>
+
+<section id="commands">
+<h2>CLI reference</h2>
+<table class="grid">
+<thead><tr><th>Command</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><code>hermes setup</code></td><td>Full first-run wizard incl. Telegram</td></tr>
+<tr><td><code>hermes gateway setup</code></td><td>Per-platform picker (registry + built-ins)</td></tr>
+<tr><td><code>hermes whatsapp</code></td><td>Baileys mode + npm install + QR pairing</td></tr>
+<tr><td><code>hermes whatsapp-cloud</code></td><td>Meta Cloud API credential wizard</td></tr>
+<tr><td><code>hermes slack manifest</code></td><td>Slack app manifest generator</td></tr>
+<tr><td><code>hermes pairing list|approve|revoke</code></td><td>DM pairing approval</td></tr>
+<tr><td><code>hermes gateway</code></td><td>Run the gateway daemon</td></tr>
+<tr><td><code>hermes status</code></td><td>Shows configured platforms + home channels</td></tr>
+</tbody>
+</table>
+</section>
+    </main>
+  </div>
+  <footer>
+    Hermes Agent fresh wiki · grounded 2026-08-19 against commit <code>42a4c91c4</code>
+    for <code>IgorTavcar/hermes-agent</code> (fork of <code>NousResearch/hermes-agent</code>);
+    citations are <code>path:line</code> into the working tree; diagrams render offline via vendored mermaid.
+  </footer>
+  <script>
+    const links = [...document.querySelectorAll('.sidebar a')];
+    const map = new Map(links.map(a => [a.getAttribute('href').slice(1), a]));
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          links.forEach(a => a.classList.remove('active'));
+          const a = map.get(e.target.id);
+          if (a) a.classList.add('active');
+        }
+      });
+    }, { rootMargin: '-80px 0px -70% 0px' });
+    document.querySelectorAll('main section[id]').forEach(s => obs.observe(s));
+  </script>
+</body>
+</html>

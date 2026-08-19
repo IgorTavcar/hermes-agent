@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LLM Kernels &amp; Adapters · Hermes Fresh Wiki</title>
+  <link rel="stylesheet" href="./style.css">
+  <script defer src="./search-index.js"></script>
+  <script defer src="./wiki.js"></script>
+  <script src="./vendor/mermaid.min.js"></script>
+  <script>
+    window.addEventListener("DOMContentLoaded", function () {
+      if (!window.mermaid) return;
+      try {
+        mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "loose",
+          themeVariables: { fontFamily: "ui-monospace, monospace", fontSize: "13px",
+            primaryColor: "#171b24", primaryBorderColor: "#2d3543", primaryTextColor: "#e7ebf2",
+            lineColor: "#c9a93a", secondaryColor: "#12151c", tertiaryColor: "#0a0c10" } });
+        mermaid.run({ querySelector: "pre.mermaid" });
+      } catch (e) { console.error("mermaid render failed", e); }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="index.html"><span class="mark">☤</span> Hermes Agent <span class="sub">Fresh Wiki</span></a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="loops.html">Turn Loops</a>
+      <a href="kernels.html" class="active">LLM Kernels</a>
+      <a href="providers.html">Providers &amp; Tiers</a>
+      <a href="channels.html">Channels</a>
+      <a href="skills.html">Self-Adaptive Skills</a>
+      <a href="transfer.html">Transferables</a>
+    </nav>
+  </header>
+  <div class="layout">
+    <aside class="sidebar">
+      <p class="toc-title">On this page</p>
+      <ul>
+        <li><a href="#shape">The four-tier shape</a></li>
+        <li><a href="#sdks">Which SDKs are wrapped</a></li>
+        <li><a href="#chat">Dialect: chat_completions</a></li>
+        <li><a href="#anthropic">Dialect: anthropic_messages</a></li>
+        <li><a href="#codex">Dialect: codex_responses</a></li>
+        <li><a href="#gemini">Dialect: Gemini native</a></li>
+        <li><a href="#bedrock">Dialect: bedrock_converse</a></li>
+        <li><a href="#callsites">Call sites in the loop</a></li>
+        <li><a href="#retries">Retries, timeouts, fallback</a></li>
+        <li><a href="#caching">Prompt caching</a></li>
+        <li><a href="#reasoning">Reasoning / thinking</a></li>
+        <li><a href="#special">Special kernels</a></li>
+        <li><a href="#schemas">Tool schemas</a></li>
+        <li><a href="#matrix">Summary matrix</a></li>
+      </ul>
+    </aside>
+    <main>
+<div class="hero">
+<h1 class="page-title">LLM Kernels &amp; Adapters</h1>
+<p class="lead">The "kernel" of the agentic loop is the layer where inference, tool-calling and streaming actually execute — per provider dialect. Hermes deliberately has no single LLM-client class: it splits the job into declarative provider profiles, format-converting transports, an imperative client-lifecycle + streaming layer, and a relay wrapper around every physical attempt. This page documents each tier, each dialect's exact conversion and streaming mechanics, and where the loop invokes them.</p>
+</div>
+
+<section id="shape">
+<h2>The four-tier shape</h2>
+<table class="grid">
+<thead><tr><th>Tier</th><th>Owns</th><th>Where</th></tr></thead>
+<tbody>
+<tr><td><strong>Provider profile</strong> (declarative)</td><td>per-provider request quirks, auth metadata, catalog</td><td><code class="cite">providers/base.py:39</code>, 36 bundled profiles in <code>plugins/model-providers/*/</code></td></tr>
+<tr><td><strong>Transport</strong> (format conversion)</td><td>messages/tools dialect conversion + response normalization</td><td><code>agent/transports/*</code> + the fat adapters <code>agent/*_adapter.py</code></td></tr>
+<tr><td><strong>Client lifecycle + streaming</strong> (imperative)</td><td>SDK client construction/caching/abort, streaming loops, delta assembly</td><td><code class="cite">run_agent.py:5311</code>, <code class="cite">agent/chat_completion_helpers.py:3833</code>, <code class="cite">agent/codex_runtime.py:1038</code></td></tr>
+<tr><td><strong>Relay wrapper</strong> (observability/interception)</td><td>wraps every physical attempt in NeMo Relay spans/codecs</td><td><code class="cite">agent/relay_llm.py:32</code></td></tr>
+</tbody>
+</table>
+<p>The abstraction boundary is stated in the transport ABC's own docstring: <em>"A transport owns the data path for one api_mode: convert_messages → convert_tools → build_kwargs → normalize_response. It does NOT own: client construction, streaming, credential refresh, prompt caching, interrupt handling, or retry logic. Those stay on AIAgent."</em> (<code class="cite">agent/transports/base.py:1</code>). Four transports register: <code>ChatCompletionsTransport</code> (<code class="cite">agent/transports/chat_completions.py:234</code>), <code>AnthropicTransport</code> (<code class="cite">agent/transports/anthropic.py:13</code>), <code>ResponsesApiTransport</code> (<code class="cite">agent/transports/codex.py:287</code>), <code>BedrockTransport</code> (<code class="cite">agent/transports/bedrock.py:15</code>).</p>
+
+<pre class="mermaid">graph LR;
+  L[conversation_loop iteration]-->K[build_api_kwargs];
+  K-->T{api_mode};
+  T-->|chat_completions|C1[ChatCompletionsTransport];
+  T-->|anthropic_messages|C2[AnthropicTransport -> anthropic_adapter];
+  T-->|codex_responses|C3[ResponsesApiTransport -> codex_runtime];
+  T-->|bedrock_converse|C4[BedrockTransport -> boto3];
+  C1-->R[relay_llm wrapper];
+  C2-->R; C3-->R; C4-->R;
+  R-->S[streaming call on daemon worker];
+  S-->N[normalize_response -> uniform shape];
+  N-->L;</pre>
+</section>
+
+<section id="sdks">
+<h2>Which SDKs are wrapped</h2>
+<ul>
+<li><code>openai==2.24.0</code> — <strong>core</strong> dependency (<code class="cite">pyproject.toml:40</code>), used for both <code>chat.completions</code> and <code>responses</code>.</li>
+<li><code>anthropic==0.87.0</code> — optional <code>[anthropic]</code> extra, lazily imported (<code class="cite">agent/anthropic_adapter.py:56</code>).</li>
+<li><code>boto3==1.42.89</code> — optional <code>[bedrock]</code> extra (<code class="cite">agent/bedrock_adapter.py:64</code>).</li>
+<li><code>httpx[socks]==0.28.1</code> — used <em>raw</em> for the hand-rolled Gemini native client and for custom http-client injection (keepalives, Entra bearer hooks).</li>
+<li><code>google-auth</code> — token minting only for Vertex, never inference (<code class="cite">agent/vertex_adapter.py:36</code>). There is <strong>no</strong> Google GenAI SDK anywhere.</li>
+<li><code>nemo-relay</code> — the observability wrapper (<code class="cite">agent/relay_runtime.py:1609</code>).</li>
+</ul>
+<p>Beyond the real SDKs, a family of <strong>duck-typed "fake OpenAI clients"</strong> all expose <code>.chat.completions.create(**kwargs)</code> so ~45 loop call sites never branch: <code>GeminiNativeClient</code> (<code class="cite">agent/gemini_native_adapter.py:1045</code>), <code>CopilotACPClient</code> (<code class="cite">agent/copilot_acp_client.py:450</code>), <code>MoAClient</code> (<code class="cite">agent/moa_loop.py:2313</code>), and the auxiliary Codex/Anthropic/Bedrock shims in <code class="cite">agent/auxiliary_client.py:1902</code> ff. Even <code>ToolCall</code> duck-types the OpenAI SDK via <code>@property function → self</code> (<code class="cite">agent/transports/types.py:45</code>).</p>
+</section>
+
+<section id="chat">
+<h2>Dialect: <code>chat_completions</code> (OpenAI-compatible)</h2>
+<ul>
+<li><strong>Message conversion is a security/compat boundary, not a format converter</strong>: <code>convert_messages()</code> (<code class="cite">agent/transports/chat_completions.py:244</code>) deletes Hermes-internal and foreign-dialect keys strict providers 400 on — <code>codex_reasoning_items</code>, <code>tool_name</code>, <code>api_content</code>, timestamps, any <code>_</code>-prefixed key — keeping Gemini's <code>extra_content</code> thought signatures only for Gemini-family models (<code class="cite">agent/transports/chat_completions.py:218</code>).</li>
+<li><strong>System prompt</strong> stays at <code>messages[0]</code>; the role swaps <code>system → developer</code> for GPT-5/Codex families (<code class="cite">agent/transports/chat_completions.py:501</code>).</li>
+<li><strong>Request quirks</strong> come from three profile hooks — <code>prepare_messages()</code>, <code>build_extra_body()</code>, <code>build_api_kwargs_extras()</code> (<code class="cite">providers/base.py:133</code>); a legacy ~20-boolean flag path survives only for unregistered providers (<code class="cite">agent/transports/chat_completions.py:498</code>).</li>
+<li><strong>Streaming</strong>: <code>chat.completions.create(stream=True, stream_options={"include_usage": True})</code>, deltas assembled in <code>_call_chat_completions</code> (<code class="cite">agent/chat_completion_helpers.py:3833</code>). Tool-call accumulation: name is <em>assigned</em>, arguments are <em>concatenated</em> — MiniMax resends full names, Ollama reuses indices (<code class="cite">agent/chat_completion_helpers.py:4220</code>). After the stream: per-call JSON validity check, argument repair, and distinct handling of "truncated by length" vs "stream dropped mid-tool-call". The streamed result is repackaged into a non-streaming-shaped <code>SimpleNamespace</code> so the loop body never notices (<code class="cite">agent/chat_completion_helpers.py:4446</code>).</li>
+<li><strong>Usage</strong>: canonical normalization in <code class="cite">agent/usage_pricing.py:1271</code>, handling Anthropic-style names leaking through OpenAI-compat proxies, DeepSeek's top-level cache counters, and reasoning-token buckets.</li>
+</ul>
+</section>
+
+<section id="anthropic">
+<h2>Dialect: <code>anthropic_messages</code></h2>
+<ul>
+<li><strong>Conversion</strong>: <code>convert_messages_to_anthropic()</code> (<code class="cite">agent/anthropic_adapter.py:2785</code>) hoists system messages out into the top-level <code>system</code>, then runs six post-passes: strip orphaned tool blocks → merge consecutive roles → ensure a leading user turn → manage thinking signatures → evict old screenshots → scrub blank text blocks.</li>
+<li><strong>Tools</strong>: <code>function.parameters → input_schema</code>, with nullable-union stripping (<code class="cite">agent/anthropic_adapter.py:1789</code>).</li>
+<li><strong>Client</strong>: <code>build_anthropic_client()</code> auth-branches per endpoint kind — API key, bearer, or the Claude-Code OAuth identity described on <a href="providers.html">Providers &amp; Tiers</a> — always with <code>max_retries=0</code> and a 900&nbsp;s timeout (<code class="cite">agent/anthropic_adapter.py:793</code>).</li>
+<li><strong>Streaming</strong>: <code>client.messages.stream()</code> as a context manager; Hermes iterates SDK events itself (<code>content_block_start/delta</code>, thinking deltas) and takes the final message from <code>get_final_message()</code> (<code class="cite">agent/chat_completion_helpers.py:4464</code>). A parallel <code>AnthropicStreamAccumulator</code> rebuilds the message from raw SSE — including <code>input_json_delta</code> partial-JSON accumulation — when the relay modified the output (<code class="cite">agent/relay_llm.py:810</code>).</li>
+<li><strong>Parse-back</strong>: content blocks split into text / thinking / tool_use, stop reasons mapped (<code>tool_use→tool_calls</code>, <code>max_tokens→length</code>, …), and the OAuth <code>mcp__</code> tool-name prefix reversed by registry lookup (<code class="cite">agent/transports/anthropic.py:80</code>).</li>
+</ul>
+<div class="callout key"><strong>Interleaved thinking ordering.</strong> When a turn interleaves <em>signed</em> thinking with tool_use, the parallel lists lose cross-type ordering and replaying in the wrong order triggers HTTP 400. The transport therefore captures a verbatim order-preserving <code>ordered_blocks</code> list — emitted only when both signed thinking and tool_use are present — and replays it as-is (<code class="cite">agent/transports/anthropic.py:97</code>). Signature lifecycle on replay: strip for third-party endpoints, keep signed only on the latest assistant message for direct Anthropic, with Nous Portal explicitly exempted (<code class="cite">agent/anthropic_adapter.py:2512</code>).</div>
+</section>
+
+<section id="codex">
+<h2>Dialect: <code>codex_responses</code> (OpenAI Responses API)</h2>
+<ul>
+<li><strong>Conversion</strong>: system messages become the top-level <code>instructions</code>; assistant tool calls become <code>function_call</code> items and tool results become <code>function_call_output</code> items — with multimodal parts allowed in outputs (<code class="cite">agent/codex_responses_adapter.py:410</code>).</li>
+<li><strong>Tools</strong> flatten to <code>{type:"function", name, description, strict:false, parameters}</code> (<code class="cite">agent/codex_responses_adapter.py:341</code>).</li>
+<li><strong>Streaming is deliberately low-level</strong>: Hermes calls <code>responses.create(stream=True)</code> raw instead of the SDK's high-level <code>responses.stream()</code>, because the consumer Codex backend drifts <code>response.completed.response.output</code> to <code>null</code> and the SDK's reconstruction throws mid-iteration. The final object is assembled only from <code>response.output_item.done</code> events (<code class="cite">agent/codex_runtime.py:1349</code>, rationale at <code class="cite">agent/codex_runtime.py:955</code>; event consumer at <code class="cite">agent/codex_runtime.py:1038</code>).</li>
+<li><strong>Reasoning continuity</strong>: reasoning items with <code>encrypted_content</code> are captured and replayed as input items, guarded by a per-item issuer filter and a session kill switch, so encrypted reasoning never replays cross-endpoint (<code class="cite">agent/codex_responses_adapter.py:1458</code>).</li>
+<li><strong>Always <code>store: false</code></strong>; <code>tools</code> omitted entirely when empty (the SDK iterates it without a None guard); Codex session headers and xAI conversation ids stamped per request (<code class="cite">agent/transports/codex.py:337</code>).</li>
+</ul>
+</section>
+
+<section id="gemini">
+<h2>Dialect: Gemini native (raw httpx, no SDK)</h2>
+<p>When the base URL is native <code>generativelanguage.googleapis.com/v1beta</code> (not the <code>/openai</code> subpath), <code>create_openai_client</code> returns <code>GeminiNativeClient</code> — a raw-httpx client masquerading as the OpenAI SDK (<code class="cite">agent/agent_runtime_helpers.py:2497</code>, <code class="cite">agent/gemini_native_adapter.py:1045</code>).</p>
+<ul>
+<li>System messages become a separate <code>systemInstruction</code>; roles map <code>assistant→model</code>, tool results become <code>functionResponse</code> parts; alternation repair refuses to fuse human text into a functionResponse turn, interposing a placeholder model turn instead (<code class="cite">agent/gemini_native_adapter.py:450</code>).</li>
+<li>Tools become <code>functionDeclarations</code> with schema sanitization (<code class="cite">agent/gemini_schema.py:134</code>); <code>tool_choice</code> maps to <code>functionCallingConfig.mode</code> AUTO/ANY/NONE.</li>
+<li><strong>Streaming</strong> is hand-rolled SSE against <code>:streamGenerateContent?alt=sse</code>. Gemini re-sends the <em>whole</em> args object each event, so Hermes diffs and emits only the incremental suffix (<code class="cite">agent/gemini_native_adapter.py:889</code>).</li>
+<li>Gemini-3 <code>thoughtSignature</code>s round-trip via <code>extra_content</code>, with a literal <code>"skip_thought_signature_validator"</code> sentinel for cross-provider replays (<code class="cite">agent/gemini_native_adapter.py:353</code>).</li>
+</ul>
+<p>Vertex AI is <em>not</em> a separate dialect — <code>agent/vertex_adapter.py</code> only mints a bearer token and builds the OpenAI-compatible Vertex URL (<code class="cite">agent/vertex_adapter.py:190</code>).</p>
+</section>
+
+<section id="bedrock">
+<h2>Dialect: <code>bedrock_converse</code></h2>
+<p>Pure boto3 (<code class="cite">agent/transports/bedrock.py:1</code>): tools become <code>toolSpec.inputSchema.json</code> (<code class="cite">agent/bedrock_adapter.py:488</code>); streaming iterates the boto3 event stream, accumulating tool-argument JSON as a string and parsing at <code>contentBlockStop</code> (<code class="cite">agent/bedrock_adapter.py:845</code>). The <em>preferred</em> path for Claude-on-Bedrock is not Converse at all — it is <code>anthropic.AnthropicBedrock</code>, for full parity on prompt caching, adaptive thinking and the 1M-context beta (<code class="cite">agent/anthropic_adapter.py:949</code>).</p>
+</section>
+
+<section id="callsites">
+<h2>Where the loop invokes the kernels</h2>
+<p>Per inner-loop iteration: <code>build_api_kwargs()</code> (<code class="cite">agent/chat_completion_helpers.py:1825</code>) → cache markers re-applied per provider per retry attempt → <code>_perform_api_call()</code> (<code class="cite">agent/conversation_loop.py:3019</code>) — streaming-preferred via <code>_interruptible_streaming_api_call</code>, else <code>relay_llm.execute</code> — wrapped in LLM-execution middleware → <code>transport.validate_response()</code> → <code>transport.normalize_response()</code> → <code>build_assistant_message()</code>.</p>
+<p><strong>The main loop is fully synchronous.</strong> Requests run on a daemon worker thread the caller polls for interrupts and staleness; cron and delegated-child contexts run inline instead, to avoid nested-thread-pool deadlocks (<code class="cite">agent/chat_completion_helpers.py:1002</code>). Async exists only in the auxiliary layer, as <code>asyncio.to_thread</code> wrappers.</p>
+<div class="callout surprise"><strong>Client lifecycle safety.</strong> Per-request clients exist because of a real memory-corruption class: a watchdog thread must never <code>close()</code> a client whose TLS socket another thread is reading. Stranger threads only <code>shutdown(SHUT_RDWR)</code> the socket; owner threads do the SDK close; both OpenAI and Anthropic request clients sit in a single-slot warm cache with <code>in_use</code>/<code>poisoned</code> flags (<code class="cite">run_agent.py:5429</code>, <code class="cite">run_agent.py:5344</code>).</div>
+</section>
+
+<section id="retries">
+<h2>Retries, timeouts, rate limits, fallback</h2>
+<ul>
+<li><strong>SDK retries are off everywhere</strong> (<code>max_retries=0</code>) — the SDK default ignores <code>Retry-After</code> and double-retries inside Hermes's own loop (<code class="cite">run_agent.py:5331</code>, <code class="cite">agent/anthropic_adapter.py:858</code>). All retry/backoff/rotation/fallback lives in the outer retry loop.</li>
+<li><strong>Three retry layers</strong>: SDK (disabled) → stream-level (<code>HERMES_STREAM_RETRIES</code>, default 2) → turn-level with jittered backoff (5–120&nbsp;s), <code>Retry-After</code> parsing, and provider-specific ladders (<code class="cite">agent/retry_utils.py:90</code>).</li>
+<li><strong>Timeouts</strong>: per-provider <code>request_timeout_seconds</code>; streaming read timeout auto-raised for local endpoints (vLLM/Ollama prefill can take minutes) and reasoning models; stale-stream watchdogs with per-family floors and a cross-turn stale-streak circuit breaker (<code class="cite">agent/chat_completion_helpers.py:3836</code>).</li>
+<li><strong>Rate limits</strong>: headers captured on every response (<code class="cite">run_agent.py:4043</code>); account-level 429 distinguished from upstream-capacity 429 by inspecting the 429's own headers; credential-pool rotation runs before model fallback (<code class="cite">run_agent.py:6423</code>).</li>
+<li><strong>Fallback chain</strong>: <code>try_activate_fallback()</code> arms an exponential primary cooldown, walks the chain skipping identical backends, and rebuilds the client through the same central router the auxiliary layer uses (<code class="cite">agent/chat_completion_helpers.py:2427</code>).</li>
+</ul>
+</section>
+
+<section id="caching">
+<h2>Prompt caching</h2>
+<ul>
+<li><strong>Anthropic-style breakpoints</strong>: a 4-marker budget — static system prefix, whole system, then the last N cacheable messages — planned by <code>build_prompt_cache_plan()</code> (<code class="cite">agent/prompt_caching.py:385</code>). Native layout puts markers on inner content blocks; OpenAI-wire proxies get envelope markers. Re-decorated per retry attempt so a mid-turn failover re-plans for the new provider (<code class="cite">agent/conversation_loop.py:1490</code>).</li>
+<li><strong><code>prompt_cache_key</code></strong> (OpenAI/xAI/Codex routing hint): one hash — <code>pck_&lt;sha256[:24]&gt;</code> over scope + instructions + sorted tools — with cron's per-fire timestamp stripped from the scope and a rotation-stable logical scope resolved from the compression lineage root (<code class="cite">agent/transports/codex.py:143</code>, <code class="cite">agent/prompt_cache_scope.py:67</code>).</li>
+<li><strong>Sticky routing keys</strong>: OpenRouter and Nous put <code>session_id</code> in the body; Codex mirrors it into <code>x-client-request-id</code>, xAI into <code>x-grok-conv-id</code> (<code class="cite">agent/transports/codex.py:627</code>).</li>
+</ul>
+</section>
+
+<section id="reasoning">
+<h2>Reasoning / thinking parameters</h2>
+<p>Hermes's canonical effort ladder is <code>none | minimal | low | medium | high | xhigh | max | ultra</code> (<code class="cite">hermes_cli/models.py:1711</code>), translated per dialect:</p>
+<table class="grid">
+<thead><tr><th>Dialect</th><th>Wire form</th><th>Where</th></tr></thead>
+<tbody>
+<tr><td>Anthropic ≥4.6 (adaptive)</td><td><code>thinking={"type":"adaptive"}</code> + <code>output_config.effort</code></td><td><code class="cite">agent/anthropic_adapter.py:3055</code></td></tr>
+<tr><td>Anthropic legacy</td><td><code>thinking={"type":"enabled","budget_tokens":N}</code>, forced <code>temperature=1</code></td><td><code class="cite">agent/anthropic_adapter.py:3072</code></td></tr>
+<tr><td>Responses / Codex</td><td><code>reasoning={"effort", "summary":"auto"}</code> + <code>include=["reasoning.encrypted_content"]</code></td><td><code class="cite">agent/transports/codex.py:426</code></td></tr>
+<tr><td>xAI Responses</td><td><code>reasoning.effort</code> only when the model supports it; per-model clamping</td><td><code class="cite">agent/transports/codex.py:439</code></td></tr>
+<tr><td>OpenRouter / generic chat</td><td><code>extra_body.reasoning</code>, clamped to the catalog's <code>supported_efforts</code></td><td><code class="cite">agent/transports/chat_completions.py:635</code></td></tr>
+<tr><td>Kimi/Moonshot</td><td>top-level <code>reasoning_effort</code> + <code>extra_body.thinking</code></td><td><code class="cite">agent/transports/chat_completions.py:554</code></td></tr>
+<tr><td>Gemini</td><td><code>thinkingConfig</code> {budget, includeThoughts, level}; omitted for Gemma (400s); output cap raised because thoughts bill against it</td><td><code class="cite">agent/transports/chat_completions.py:100</code></td></tr>
+</tbody>
+</table>
+<p>On the chat wire, providers that drop summary-part boundaries get them re-inserted by <code>separate_glued_reasoning_blocks()</code> (<code class="cite">agent/reasoning_summaries.py:37</code>); DeepSeek-v4/Kimi thinking modes <em>require</em> <code>reasoning_content</code> on every assistant tool-call message, so it is padded with a single space when absent (<code class="cite">agent/chat_completion_helpers.py:2210</code>).</p>
+</section>
+
+<section id="special">
+<h2>Special kernels</h2>
+<table class="grid">
+<thead><tr><th>Kernel</th><th>What it is</th><th>Where</th></tr></thead>
+<tbody>
+<tr><td><strong>codex_app_server</strong></td><td>Opt-in: Hermes hands the <em>whole turn</em> to a <code>codex app-server</code> subprocess over newline-delimited JSON-RPC, consuming <code>item/*</code> notifications until <code>turn/completed</code>. Hermes tools are re-exposed to the subprocess as a stdio MCP server — deliberately excluding terminal, file tools and the agent-loop tools that need live state.</td><td><code class="cite">agent/transports/codex_app_server.py:53</code>, <code class="cite">agent/transports/hermes_tools_mcp_server.py:1</code></td></tr>
+<tr><td><strong>MoA</strong></td><td>A virtual provider with no wire of its own: reference models fan out in a thread pool, a guidance block is built, and the aggregator slot's real client answers.</td><td><code class="cite">agent/moa_loop.py:2313</code></td></tr>
+<tr><td><strong>Copilot ACP</strong></td><td>Shells out to <code>copilot --acp</code> over stdio; no true streaming (one-shot faked into two chunks); tool calls recovered from <code>&lt;tool_call&gt;{…}&lt;/tool_call&gt;</code> text by regex.</td><td><code class="cite">agent/copilot_acp_client.py:450</code>, regex at <code class="cite">agent/copilot_acp_client.py:36</code></td></tr>
+<tr><td><strong>Local models</strong></td><td>No dedicated vLLM/Ollama transport — plain chat_completions with accommodations: raised read timeouts for prefill, Ollama index-reuse workaround, <code>num_ctx</code> passthrough, llama.cpp grammar-parse recovery (strip <code>pattern</code>/<code>format</code> and retry once).</td><td><code class="cite">agent/chat_completion_helpers.py:3850</code>, <code class="cite">agent/conversation_loop.py:4956</code></td></tr>
+<tr><td><strong>Auxiliary layer</strong></td><td>Compression, titles, vision, MoA advisors, subagent helpers all route through one central router whose contract is "the returned client always exposes <code>.chat.completions.create()</code>".</td><td><code class="cite">agent/auxiliary_client.py:6193</code></td></tr>
+<tr><td><strong>Plugin LLM facade</strong></td><td>Trusted plugins get <code>ctx.llm.complete()</code> with fail-closed trust policies; plugins never see raw credentials.</td><td><code class="cite">agent/plugin_llm.py:716</code></td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="schemas">
+<h2>Tool schemas: from registry to every dialect</h2>
+<p>Schemas are <strong>hand-written dicts</strong>, self-registered at import time — there is no signature introspection anywhere in this path:</p>
+<pre><code>registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA,
+                  handler=_handle_read_file, check_fn=_check_file_reqs, ...)</code></pre>
+<p>(<code class="cite">tools/file_tools.py:2809</code>.) The pipeline: <code>toolsets.py</code> composes toolsets (<code class="cite">toolsets.py:107</code>) → <code>get_tool_definitions()</code> memoizes on registry generation + config mtime (<code class="cite">model_tools.py:323</code>) → <code>ToolRegistry.get_definitions()</code> filters by <code>check_fn</code> and applies <code>dynamic_schema_overrides</code> — which is how <code>delegate_task</code>'s description reflects live concurrency config (<code class="cite">tools/registry.py:1018</code>) → a cross-provider hardening pass renames illegal property keys, strips <code>$ref</code> siblings and top-level combinators, and collapses nullable unions (<code class="cite">tools/schema_sanitizer.py:120</code>), with the inverse rename applied at dispatch so handlers see original names (<code class="cite">model_tools.py:831</code>). Each transport then converts that one canonical list to its dialect (identity, <code>input_schema</code>, flat Responses shape, <code>toolSpec.inputSchema.json</code>, <code>functionDeclarations</code>).</p>
+</section>
+
+<section id="matrix">
+<h2>Summary matrix</h2>
+<div style="overflow-x:auto">
+<table class="grid">
+<thead><tr><th>Dialect</th><th>SDK / wire</th><th>Streaming</th><th>Tool calls on the wire</th><th>Parse-back</th></tr></thead>
+<tbody>
+<tr><td><code>chat_completions</code></td><td><code>openai==2.24.0</code></td><td>SDK SSE, deltas assembled by hand</td><td><code>tools[].function</code></td><td><code>delta.tool_calls</code>: name assigned, args concatenated</td></tr>
+<tr><td><code>anthropic_messages</code></td><td><code>anthropic==0.87.0</code></td><td><code>messages.stream()</code> + parallel raw-SSE accumulator</td><td><code>input_schema</code></td><td><code>tool_use</code> blocks; <code>input_json_delta</code> partial JSON</td></tr>
+<tr><td><code>codex_responses</code></td><td><code>openai</code> Responses resource</td><td>raw <code>stream=True</code> event iterator (deliberately not <code>responses.stream()</code>)</td><td>flat <code>{type:"function",...}</code></td><td><code>function_call</code> output items</td></tr>
+<tr><td><code>bedrock_converse</code></td><td><code>boto3</code></td><td>boto3 event stream</td><td><code>toolSpec.inputSchema.json</code></td><td><code>toolUse</code> deltas, JSON parsed at block stop</td></tr>
+<tr><td>Gemini native</td><td><strong>raw httpx</strong></td><td>hand-rolled SSE</td><td><code>functionDeclarations</code></td><td><code>parts[].functionCall</code>, args suffix-diffed</td></tr>
+<tr><td><code>copilot-acp</code></td><td>subprocess JSON-RPC</td><td>none (faked chunks)</td><td>described in prompt text</td><td>XML <code>&lt;tool_call&gt;</code> regex</td></tr>
+<tr><td><code>codex_app_server</code></td><td>subprocess JSON-RPC 2.0</td><td><code>item/*</code> notifications</td><td>codex-owned; Hermes tools via stdio MCP</td><td>event projector</td></tr>
+<tr><td><code>moa</code> (virtual)</td><td>none of its own</td><td>delegates to aggregator</td><td>inherited</td><td>inherited</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+    </main>
+  </div>
+  <footer>
+    Hermes Agent fresh wiki · grounded 2026-08-19 against commit <code>42a4c91c4</code>
+    for <code>IgorTavcar/hermes-agent</code> (fork of <code>NousResearch/hermes-agent</code>);
+    citations are <code>path:line</code> into the working tree; diagrams render offline via vendored mermaid.
+  </footer>
+  <script>
+    const links = [...document.querySelectorAll('.sidebar a')];
+    const map = new Map(links.map(a => [a.getAttribute('href').slice(1), a]));
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          links.forEach(a => a.classList.remove('active'));
+          const a = map.get(e.target.id);
+          if (a) a.classList.add('active');
+        }
+      });
+    }, { rootMargin: '-80px 0px -70% 0px' });
+    document.querySelectorAll('main section[id]').forEach(s => obs.observe(s));
+  </script>
+</body>
+</html>

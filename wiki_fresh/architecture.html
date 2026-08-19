@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Architecture &amp; Internals · Hermes Fresh Wiki</title>
+  <link rel="stylesheet" href="./style.css">
+  <script defer src="./search-index.js"></script>
+  <script defer src="./wiki.js"></script>
+  <script src="./vendor/mermaid.min.js"></script>
+  <script>
+    window.addEventListener("DOMContentLoaded", function () {
+      if (!window.mermaid) return;
+      try {
+        mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "loose",
+          themeVariables: { fontFamily: "ui-monospace, monospace", fontSize: "13px",
+            primaryColor: "#171b24", primaryBorderColor: "#2d3543", primaryTextColor: "#e7ebf2",
+            lineColor: "#c9a93a", secondaryColor: "#12151c", tertiaryColor: "#0a0c10" } });
+        mermaid.run({ querySelector: "pre.mermaid" });
+      } catch (e) { console.error("mermaid render failed", e); }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="index.html"><span class="mark">☤</span> Hermes Agent <span class="sub">Fresh Wiki</span></a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="architecture.html" class="active">Architecture</a>
+      <a href="loops.html">Turn Loops</a>
+      <a href="kernels.html">LLM Kernels</a>
+      <a href="providers.html">Providers &amp; Tiers</a>
+      <a href="channels.html">Channels</a>
+      <a href="skills.html">Self-Adaptive Skills</a>
+      <a href="transfer.html">Transferables</a>
+    </nav>
+  </header>
+  <div class="layout">
+    <aside class="sidebar">
+      <p class="toc-title">On this page</p>
+      <ul>
+        <li><a href="#one-core">One shared core</a></li>
+        <li><a href="#entry-points">Entry points &amp; process model</a></li>
+        <li><a href="#gateway-inbound">Gateway: inbound path</a></li>
+        <li><a href="#session-keying">Session keying</a></li>
+        <li><a href="#session-store">Session store &amp; state DB</a></li>
+        <li><a href="#concurrency">Concurrency &amp; queueing</a></li>
+        <li><a href="#outbound">Gateway: outbound path</a></li>
+        <li><a href="#compaction">Context management</a></li>
+        <li><a href="#delegation">Subagents: delegate_task</a></li>
+        <li><a href="#interaction">Live agent-to-agent I/O</a></li>
+        <li><a href="#rpc">execute_code RPC</a></li>
+        <li><a href="#other-shapes">Other multi-agent shapes</a></li>
+        <li><a href="#extension">Hooks, events, middleware</a></li>
+        <li><a href="#identity">Identity propagation</a></li>
+      </ul>
+    </aside>
+    <main>
+<div class="hero">
+<h1 class="page-title">Architecture &amp; Internals</h1>
+<p class="lead">Hermes is a set of thin drivers wrapped around exactly one agent core: the <code>AIAgent</code> class and its single production turn loop. The CLI, the TUI, the multi-platform gateway daemon, the cron scheduler, the ACP adapter and the batch runner all feed the same loop — they differ only in how messages get in and how replies get out. This page maps that core, the gateway that fronts it, the SQLite state layer beneath it, and the internals of how agents spawn, steer and talk to each other.</p>
+</div>
+
+<section id="one-core">
+<h2>One shared core</h2>
+<p>The only agent class is <code>AIAgent</code> at <code class="cite">run_agent.py:412</code>. Its constructor (<code class="cite">run_agent.py:435</code>) and its public turn method <code>run_conversation()</code> (<code class="cite">run_agent.py:8339</code>) are thin forwarders into the <code>agent/</code> package: real construction happens in <code>agent/agent_init.init_agent()</code> (<code class="cite">agent/agent_init.py:493</code>) and the real loop is <code>agent/conversation_loop.run_conversation()</code> (<code class="cite">agent/conversation_loop.py:1704</code>). There is no second code path — every surface below drives this one function.</p>
+
+<pre class="mermaid">graph LR;
+  CLI[hermes CLI / TUI]-->CORE;
+  OS[one-shot -z / -q]-->CORE;
+  GW[gateway daemon]-->CORE;
+  CRON[cron scheduler]-->CORE;
+  ACP[ACP adapter]-->CORE;
+  BATCH[batch_runner]-->CORE;
+  KAN[kanban workers]-->CORE;
+  CORE[AIAgent run_agent.py:412<br/>run_conversation conversation_loop.py:1704];
+  CORE-->TE[tool_executor];
+  CORE-->CC[context_compressor];
+  CORE-->DT[delegate_task];
+  CORE-->DB[(SessionDB ~/.hermes/state.db)];</pre>
+
+<div class="callout key"><strong>Key insight.</strong> The loop head is a plain synchronous <code>while (api_call_count &lt; agent.max_iterations and agent.iteration_budget.remaining &gt; 0) or agent._budget_grace_call</code> at <code class="cite">agent/conversation_loop.py:1922</code>. Everything else in the repo is scaffolding to feed, protect, persist, and observe that loop. The loop itself is dissected on the <a href="loops.html">Turn Loops</a> page.</div>
+</section>
+
+<section id="entry-points">
+<h2>Entry points &amp; process model</h2>
+<p>Three console scripts are declared at <code class="cite">pyproject.toml:372</code>: <code>hermes</code> → <code>hermes_cli.main:main</code>, <code>hermes-agent</code> → <code>run_agent:main</code> (raw Fire dev harness), and <code>hermes-acp</code> → <code>acp_adapter.entry:main</code>.</p>
+
+<table class="grid">
+<thead><tr><th>Mode</th><th>Entry</th><th>Process model</th></tr></thead>
+<tbody>
+<tr><td><strong>Interactive CLI</strong></td><td><code class="cite">hermes_cli/main.py:12228</code> → <code>cmd_chat</code> → <code>cli.main()</code> (<code class="cite">cli.py:20165</code>)</td><td>Single process. <code>HermesCLI</code> (<code class="cite">cli.py:4844</code>) runs a <code>process_loop()</code> worker thread (<code class="cite">cli.py:19461</code>) pulling from a queue; the agent turn runs synchronously on that thread.</td></tr>
+<tr><td><strong>One-shot (<code>-z</code>/<code>-q</code>)</strong></td><td><code>run_oneshot()</code> at <code class="cite">hermes_cli/oneshot.py:170</code></td><td>One process, one turn, print, exit. Forces YOLO mode (<code class="cite">hermes_cli/oneshot.py:221</code>) and declares a stateless channel so delegation runs inline instead of background (<code class="cite">hermes_cli/oneshot.py:226</code>).</td></tr>
+<tr><td><strong>TUI (Ink/React)</strong></td><td>Node spawns <code>python -m tui_gateway.entry</code> (<code class="cite">ui-tui/src/gatewayClient.ts:356</code>)</td><td>Two processes: Node TUI ↔ Python over newline-delimited JSON-RPC on stdio; one daemon thread per turn (<code class="cite">tui_gateway/methods_prompt.py:803</code>).</td></tr>
+<tr><td><strong>Gateway daemon</strong></td><td><code>main()</code> at <code class="cite">gateway/run.py:30647</code> → <code>start_gateway</code> (<code class="cite">gateway/run.py:29946</code>)</td><td>One asyncio process, PID-locked (<code class="cite">gateway/run.py:29982</code>); blocking agent work offloaded to a 10-worker <code>ThreadPoolExecutor</code> (<code class="cite">gateway/run.py:24197</code>). Exits via <code>os._exit</code> to defeat wedged threads (<code class="cite">gateway/run.py:30775</code>).</td></tr>
+<tr><td><strong>ACP adapter</strong></td><td><code>acp_adapter/entry.py</code>; server <code>HermesACPAgent</code> (<code class="cite">acp_adapter/server.py:598</code>)</td><td>JSON-RPC over stdio; stdout reserved for the protocol.</td></tr>
+<tr><td><strong>MCP server</strong></td><td><code>run_mcp_server()</code> at <code class="cite">mcp_serve.py:1029</code></td><td>Stdio MCP process exposing <em>gateway conversations</em> as tools (<code>conversations_list</code>, <code>messages_read</code>, <code>events_poll</code>, …), reading <code>state.db</code> directly (<code class="cite">mcp_serve.py:75</code>).</td></tr>
+<tr><td><strong>Cron</strong></td><td><code>tick()</code> in <code>cron/scheduler.py</code>, ticked in-process every 60&nbsp;s by the gateway (<code class="cite">gateway/run.py:29857</code>)</td><td>LLM jobs build a fresh <code>AIAgent</code> in-process (<code class="cite">cron/scheduler.py:4796</code>); <code>no_agent</code> jobs run <code>subprocess.Popen</code> scripts (<code class="cite">cron/scheduler.py:3621</code>).</td></tr>
+<tr><td><strong>Dashboard / Web</strong></td><td>FastAPI app at <code class="cite">hermes_cli/web_server.py:481</code></td><td>Serves the Vite/React SPA in <code>web/</code> and mounts the same <code>tui_gateway</code> WS dispatch surface the TUI uses (<code class="cite">hermes_cli/web_server.py:17098</code>).</td></tr>
+<tr><td><strong>Batch / evals</strong></td><td><code>BatchRunner</code> at <code class="cite">batch_runner.py:529</code></td><td>Multiprocessing fan-out over JSONL datasets (<code class="cite">batch_runner.py:400</code>).</td></tr>
+</tbody>
+</table>
+
+<div class="callout info"><strong>Process-model summary.</strong> The gateway is a <em>single</em> asyncio process. Subagents are <strong>threads in the same process</strong>, not subprocesses. The only routine subprocess agents are Kanban workers (spawned as <code>hermes … chat -q</code> via <code>subprocess.Popen</code>, <code class="cite">hermes_cli/kanban_db.py:10876</code>) and cron <code>no_agent</code> scripts.</div>
+</section>
+
+<section id="gateway-inbound">
+<h2>Gateway: inbound path</h2>
+<p>The gateway controller is <code>GatewayRunner</code> at <code class="cite">gateway/run.py:6547</code>. Platform adapters subclass <code>BasePlatformAdapter</code> (<code class="cite">gateway/platforms/base.py:2890</code>); built-ins live in <code>gateway/platforms/</code>, plugin platforms register through <code>PlatformRegistry</code> (<code class="cite">gateway/platform_registry.py:232</code>), and the <code>Platform</code> enum even fabricates pseudo-members for plugin platforms via <code>_missing_()</code> (<code class="cite">gateway/config.py:348</code>).</p>
+
+<p>A message travels through a strictly ordered pipeline:</p>
+<ol>
+<li><strong>Normalize.</strong> The adapter converts a platform update into a <code>MessageEvent</code> (<code class="cite">gateway/platforms/base.py:2300</code>) carrying a <code>SessionSource</code> (<code class="cite">gateway/session.py:149</code>) and calls <code>handle_message()</code> (<code class="cite">gateway/platforms/base.py:5981</code>).</li>
+<li><strong>Key.</strong> <code>build_session_key(...)</code> is derived right at the adapter boundary (<code class="cite">gateway/platforms/base.py:6006</code>).</li>
+<li><strong>Gate.</strong> A per-session busy guard (<code>_active_sessions</code>, <code class="cite">gateway/platforms/base.py:6033</code>) either dispatches, merges the message into a pending FIFO (<code class="cite">gateway/platforms/base.py:6163</code>), or — for <code>/stop</code>, <code>/new</code>, <code>/reset</code> — interrupts then dispatches (<code class="cite">gateway/platforms/base.py:6056</code>).</li>
+<li><strong>Spawn.</strong> <code>_start_session_processing()</code> installs the guard and creates an asyncio task per message (<code class="cite">gateway/platforms/base.py:5817</code>).</li>
+<li><strong>Route.</strong> The installed handler is <code>GatewayRunner._handle_message</code> (<code class="cite">gateway/run.py:16237</code>): reset inherited context vars (<code class="cite">gateway/run.py:16265</code>), resolve profile route (fail-closed, <code class="cite">gateway/run.py:16289</code>), run the <code>pre_gateway_dispatch</code> plugin hook <em>before</em> auth (<code class="cite">gateway/run.py:16334</code>), then auth/pairing, slash commands, and finally <code>_handle_message_with_agent</code> (<code class="cite">gateway/run.py:18574</code>).</li>
+<li><strong>Resolve session.</strong> <code>SessionStore.get_or_create_session</code> (<code class="cite">gateway/session.py:2535</code>), a durable active-turn marker (<code class="cite">gateway/run.py:18344</code>), and a cross-process per-session-id turn lease (<code class="cite">gateway/turn_lease.py:152</code>).</li>
+<li><strong>Run.</strong> <code>_run_agent_inner</code> (<code class="cite">gateway/run.py:27763</code>) builds a <code>TurnRunner</code> (<code class="cite">gateway/run.py:4160</code>) and submits the blocking turn to the thread pool (<code class="cite">gateway/run.py:28726</code>); <code>TurnRunner.run_sync</code> resolves or creates the cached <code>AIAgent</code> and calls <code>agent.run_conversation(...)</code> (<code class="cite">gateway/run.py:6272</code>).</li>
+</ol>
+
+<pre class="mermaid">sequenceDiagram
+  participant P as Platform SDK
+  participant A as BasePlatformAdapter
+  participant R as GatewayRunner
+  participant S as SessionStore
+  participant T as ThreadPool
+  participant AG as AIAgent
+  P->>A: platform update
+  A->>A: MessageEvent + build_session_key
+  A->>A: busy guard / pending FIFO
+  A->>R: _handle_message(event)
+  R->>R: reset_session_vars, profile route, hooks, auth
+  R->>S: get_or_create_session + turn lease
+  R->>T: TurnRunner.run_sync (off event loop)
+  T->>AG: run_conversation()
+  AG-->>R: stream events (live)
+  AG-->>A: final reply / None (already streamed)</pre>
+</section>
+
+<section id="session-keying">
+<h2>Session keying — the exact rules</h2>
+<p>Single source of truth: <code>build_session_key()</code> at <code class="cite">gateway/session.py:1090</code>, prefixed by a namespace from <code>_session_key_namespace()</code> (<code class="cite">gateway/session.py:1070</code>) — <code>agent:main</code> for the default profile, <code>agent:&lt;profile&gt;</code> when multiplexing.</p>
+<ul>
+<li><strong>DMs</strong>: <code>&lt;ns&gt;:&lt;platform&gt;:dm[:scope_id][:chat_id][:thread_id]</code>, falling back to the sender's user id when there is no chat id — the explicit anti-cross-user-bleed guard (<code class="cite">gateway/session.py:1149</code>).</li>
+<li><strong>Groups/channels/threads</strong>: chat-type keyed, with <em>per-user isolation in groups on by default</em> (<code>group_sessions_per_user=True</code>, <code class="cite">gateway/session.py:1092</code>) while <em>threads are shared by default</em> (<code class="cite">gateway/session.py:1200</code>).</li>
+<li>WhatsApp JID/LID identifiers are canonicalized on both sides (<code class="cite">gateway/session.py:1140</code>); Discord auto-thread continuity hashes the channel-initiating message and its thread follow-ups to the same key via <code>prospective_thread_id</code> (<code class="cite">gateway/session.py:1177</code>).</li>
+</ul>
+<div class="callout key"><strong>So:</strong> sessions are per <em>(profile, platform, chat, thread — and, in groups only, per user)</em>. Not simply per-user, not simply per-channel.</div>
+</section>
+
+<section id="session-store">
+<h2>Session store &amp; the state DB</h2>
+<p><code>SessionStore</code> (<code class="cite">gateway/session.py:1245</code>) keeps routing metadata and transcripts in SQLite via <code>SessionDB</code>, falling back to legacy JSONL if SQLite is unavailable. It is synchronous and lock-guarded; the event loop reaches it through <code>AsyncSessionStore</code>, a <code>__getattr__</code> proxy that wraps every call in <code>asyncio.to_thread</code> (<code class="cite">gateway/session.py:1221</code>). The routing record is <code>SessionEntry</code> (<code class="cite">gateway/session.py:777</code>): <code>session_key → session_id</code> plus origin, token/cost counters, suspension and model-override fields, persisted both to <code>sessions.json</code> and to the <code>gateway_routing</code> table (<code class="cite">hermes_state_common.py:373</code>).</p>
+
+<p>The database itself is <code>~/.hermes/state.db</code> (<code class="cite">hermes_state.py:379</code>; home resolved by <code>get_hermes_home()</code>, <code class="cite">hermes_constants.py:114</code>), owned by <code>SessionDB</code> (<code class="cite">hermes_state.py:3093</code>) with schema version 26 (<code class="cite">hermes_state_common.py:219</code>) and DDL at <code class="cite">hermes_state_common.py:249</code>:</p>
+
+<table class="grid">
+<thead><tr><th>Table</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><code>sessions</code></td><td>One row per conversation: id, session_key, <code>parent_session_id</code> (subagent lineage), model + config, token/cost columns, compression state, profile, archived/pinned flags (<code class="cite">hermes_state_common.py:259</code>).</td></tr>
+<tr><td><code>messages</code></td><td>Transcript rows with role, content, tool_calls, reasoning, and three lifecycle flags — <code>active</code>, <code>compacted</code>, <code>observed</code> (<code class="cite">hermes_state_common.py:320</code>).</td></tr>
+<tr><td><code>system_prompts</code></td><td>Content-addressed prompt dedup, hash primary key (<code class="cite">hermes_state_common.py:254</code>).</td></tr>
+<tr><td><code>session_model_usage</code></td><td>Per (session, model, billing route, task) usage rollup (<code class="cite">hermes_state_common.py:346</code>).</td></tr>
+<tr><td><code>gateway_routing</code></td><td>Durable (scope, session_key) → routing-entry JSON (<code class="cite">hermes_state_common.py:373</code>).</td></tr>
+<tr><td><code>compression_locks</code>, <code>session_turn_leases</code></td><td>Cross-process compaction and turn serialization (<code class="cite">hermes_state_common.py:386</code>).</td></tr>
+<tr><td><code>async_delegations</code></td><td>Durable background-delegation ledger with delivery claims and owner PID (<code class="cite">hermes_state_common.py:400</code>).</td></tr>
+<tr><td><code>messages_fts</code> (+ trigram)</td><td>FTS5 full-text search, with a CJK trigram index over a non-tool view (<code class="cite">hermes_state_common.py:484</code>).</td></tr>
+</tbody>
+</table>
+
+<p>Reads go through <code>SessionDB.get_messages()</code> (<code class="cite">hermes_state.py:10138</code>) — ordered by AUTOINCREMENT id, deliberately not timestamp, with three visibility modes (active-only, include-compacted, include-inactive) and keyset pagination. Writes flow from <code>AIAgent._persist_session</code> (<code class="cite">run_agent.py:1926</code>) through a sequence-repair step that fixes <code>user;user</code> alternation wedges (<code class="cite">run_agent.py:2019</code>).</p>
+</section>
+
+<section id="concurrency">
+<h2>Concurrency &amp; queueing</h2>
+<table class="grid">
+<thead><tr><th>Mechanism</th><th>Where</th></tr></thead>
+<tbody>
+<tr><td>One asyncio task per inbound message</td><td><code class="cite">gateway/platforms/base.py:5820</code></td></tr>
+<tr><td>Per-session adapter guard (<code>_active_sessions: Dict[str, asyncio.Event]</code>)</td><td><code class="cite">gateway/platforms/base.py:3054</code></td></tr>
+<tr><td>Per-session pending FIFO with message merge</td><td><code class="cite">gateway/platforms/base.py:3055</code></td></tr>
+<tr><td>Cross-process durable turn lease per session_id</td><td><code class="cite">gateway/turn_lease.py:152</code></td></tr>
+<tr><td>Global cap on simultaneous active chat sessions</td><td><code class="cite">gateway/run.py:9691</code>, rejection at <code class="cite">gateway/run.py:17756</code></td></tr>
+<tr><td>Blocking agent work off the event loop (10-worker pool)</td><td><code class="cite">gateway/run.py:24197</code></td></tr>
+<tr><td>LRU-cached <code>AIAgent</code> per session_key (preserves prompt cache)</td><td><code class="cite">gateway/run.py:6883</code></td></tr>
+<tr><td>Supervised background watchers, restart cap 5</td><td><code class="cite">gateway/run.py:13159</code>, <code class="cite">gateway/run.py:13146</code></td></tr>
+</tbody>
+</table>
+<p>The supervised watcher set started at <code class="cite">gateway/run.py:13050</code> includes session-expiry, session-stall, kanban notifier/dispatcher, platform reconnect, handoff, async-delegation, loop-wakeup, scale-to-zero and drain-control watchers — the gateway's "outer outer loop".</p>
+</section>
+
+<section id="outbound">
+<h2>Gateway: outbound path</h2>
+<p>Two distinct paths carry output back to the user:</p>
+<ul>
+<li><strong>Streaming, during the turn.</strong> <code>GatewayStreamConsumer</code> (<code class="cite">gateway/stream_consumer.py:156</code>) is the single sink for typed events defined in <code class="cite">gateway/stream_events.py:44</code> (<code>MessageChunk</code> plus tool/lifecycle events). The contract is explicit: "smart agent emits structured data, smart gateway decides delivery" — and stream events are presentation-only, never persisted to history (<code class="cite">gateway/stream_events.py:26</code>).</li>
+<li><strong>Final reply / cron / notifications.</strong> <code>DeliveryRouter.deliver()</code> (<code class="cite">gateway/delivery.py:318</code>) fans out over <code>DeliveryTarget</code>s parsed from strings like <code>origin</code>, <code>telegram</code>, <code>telegram:123456:789</code> (<code class="cite">gateway/delivery.py:231</code>), with a <code>DeadTargetRegistry</code> short-circuiting unreachable chats (<code class="cite">gateway/delivery.py:340</code>).</li>
+</ul>
+<p>The handler return contract: <code>Optional[Union[str, EphemeralReply]]</code> — <code>None</code> means "already delivered via streaming" (<code class="cite">gateway/platforms/base.py:2782</code>); stale replies are suppressed when the session was interrupted mid-turn (<code class="cite">gateway/platforms/base.py:6297</code>).</p>
+</section>
+
+<section id="compaction">
+<h2>Context management</h2>
+<p>Context handling is pluggable behind <code>ContextEngine(ABC)</code> (<code class="cite">agent/context_engine.py:89</code>) with the lifecycle contract <code>on_session_start → update_from_response → should_compress → compress → on_session_end</code>. The default engine is <code>ContextCompressor</code> (<code class="cite">agent/context_compressor.py:1848</code>), whose documented algorithm is:</p>
+<ol>
+<li>prune old tool results (no LLM call),</li>
+<li>protect the head (system prompt + first exchange),</li>
+<li>protect the tail by token budget (~20K, <code class="cite">agent/context_compressor.py:2099</code>),</li>
+<li>summarize the middle with a structured LLM prompt,</li>
+<li>iteratively update that summary on later compactions.</li>
+</ol>
+<p>Durable anti-thrash guards persist compression-failure cooldowns and ineffective-compression streaks across restarts (<code class="cite">agent/context_compressor.py:2414</code>, <code class="cite">agent/context_compressor.py:2350</code>), and there is a micro-compaction rolling-summary path (<code class="cite">agent/context_compressor.py:1899</code>). In-place compaction does <em>not</em> rotate the session id — the gateway re-baselines transcripts when it sees <code>agent._last_compaction_in_place</code> (<code class="cite">gateway/run.py:6318</code>).</p>
+<div class="callout warn"><strong>Don't confuse the two compressors.</strong> <code>trajectory_compressor.py</code> at the repo root (<code class="cite">trajectory_compressor.py:332</code>) is <em>offline dataset post-processing</em> for training-data trajectories — it pairs with <code>batch_runner.py</code>, not with live context management.</div>
+</section>
+
+<section id="delegation">
+<h2>Subagents: <code>delegate_task</code></h2>
+<p>Delegation is a tool the model calls: <code>delegate_task(...)</code> at <code class="cite">tools/delegate_tool.py:3597</code>, dispatched agent-side through <code>AIAgent._dispatch_delegate_task</code> (<code class="cite">run_agent.py:8214</code>). The central policy lives right there:</p>
+<pre><code>_is_subagent = getattr(self, "_delegate_depth", 0) &gt; 0
+return _delegate_task(..., background=(not _is_subagent), parent_agent=self)</code></pre>
+<p><strong>Top-level delegations always run in the background</strong>; a delegation issued by an orchestrator subagent stays synchronous, because the orchestrator needs results inside its own turn and does not own the gateway session an async result would route back to (<code class="cite">run_agent.py:8226</code>). The model-facing <code>background</code> parameter is deliberately ignored (<code class="cite">run_agent.py:8236</code>).</p>
+
+<h3>Child construction &amp; isolation</h3>
+<p><code>_build_child_agent()</code> (<code class="cite">tools/delegate_tool.py:1578</code>) constructs a real <code>AIAgent</code> with:</p>
+<ul>
+<li><strong>Depth/role</strong>: <code>child_depth = parent._delegate_depth + 1</code>; role degrades to <code>leaf</code> unless orchestration is explicitly allowed, and leaf children have <code>delegate_task</code> stripped from their toolset (<code class="cite">tools/delegate_tool.py:1278</code>).</li>
+<li><strong>Toolsets</strong>: inherited and <em>intersected</em>, never expanded — "subagent must not gain tools the parent lacks" (<code class="cite">tools/delegate_tool.py:1660</code>).</li>
+<li><strong>Context</strong>: an ephemeral child system prompt (<code class="cite">tools/delegate_tool.py:1173</code>) with <code>skip_context_files=True</code>, <code>skip_memory=True</code>, <code>platform="subagent"</code>, <code>quiet_mode=True</code> (<code class="cite">tools/delegate_tool.py:1950</code>).</li>
+<li><strong>Persistence</strong>: each child gets its own dedicated <code>SessionDB</code> handle at the parent's db path — so a parent teardown can't close it under a background child — with lineage via <code>parent_session_id</code> (<code class="cite">tools/delegate_tool.py:1900</code>).</li>
+<li><strong>Identity</strong>: <code>subagent_id = "sa-&lt;idx&gt;-&lt;uuid8&gt;"</code>, plus a weakref back to the parent used for ownership checks (<code class="cite">tools/delegate_tool.py:1998</code>).</li>
+<li><strong>Worktree isolation (opt-in)</strong>: each child can get its own git worktree branched from HEAD (<code class="cite">tools/delegate_tool.py:887</code>).</li>
+<li><strong>Approvals</strong>: subagents run under auto-approve/auto-deny callbacks, never an interactive prompt (<code class="cite">tools/delegate_tool.py:78</code>).</li>
+</ul>
+
+<h3>Fan-out and result return</h3>
+<p><code>_execute_and_aggregate()</code> (<code class="cite">tools/delegate_tool.py:3890</code>) runs a single task inline; N tasks fan out on a <code>DaemonThreadPoolExecutor</code> with per-child contextvar copies (<code class="cite">tools/delegate_tool.py:3921</code>), polled with <code>wait(timeout=…)</code> instead of <code>as_completed()</code> so a parent interrupt can abandon wedged children (<code class="cite">tools/delegate_tool.py:3939</code>). Each child ultimately calls <code>child.run_conversation(user_message=goal, …)</code> (<code class="cite">tools/delegate_tool.py:2791</code>). Limits: max concurrent children default 10 (<code class="cite">tools/delegate_tool.py:846</code>), spawn depth default 1 — flat parent→child (<code class="cite">tools/delegate_tool.py:973</code>).</p>
+
+<p><strong>Synchronous path</strong>: the aggregate dict — per-task status, summary, api_calls, exit_reason, tokens, tool_trace — is JSON-serialized as the tool result (<code class="cite">tools/delegate_tool.py:4329</code>), with a summary byte-budget that spills to file when exceeded (<code class="cite">tools/delegate_tool.py:2371</code>).</p>
+
+<p><strong>Background path</strong>: <code>dispatch_async_delegation_batch()</code> (<code class="cite">tools/async_delegation.py:1015</code>) occupies one async slot for the whole fan-out and returns <code>{"status": "dispatched", "delegation_id": …}</code> immediately — the model is told not to wait or poll (<code class="cite">tools/delegate_tool.py:4265</code>). On completion, <code>_push_completion_event</code> persists to the <code>async_delegations</code> table and enqueues onto <code>process_registry.completion_queue</code> (<code class="cite">tools/async_delegation.py:1006</code>, queue at <code class="cite">tools/process_registry.py:455</code>). Consumers: the gateway's <code>_async_delegation_watcher</code> (<code class="cite">gateway/run.py:25485</code>), which coalesces same-session completions into <em>one synthetic turn</em> with durable claim/ack so nothing double-injects (<code class="cite">gateway/run.py:25424</code>), and the CLI's idle drain (<code class="cite">cli.py:19481</code>).</p>
+
+<p>Both paths converge in <code>_finalize_child_results</code> (<code class="cite">tools/delegate_tool.py:3403</code>): summary budget → parent memory-manager <code>on_delegation(...)</code> → <code>subagent_stop</code> plugin hook per child → child-cost rollup onto the parent session.</p>
+
+<pre class="mermaid">graph TD;
+  P[parent turn: delegate_task]-->G{guards: pause, depth};
+  G-->B[_build_child_agent × N<br/>own SessionDB handle, toolset ∩ parent];
+  B-->M{top-level?};
+  M-->|yes: background|Q[dispatch_async_delegation_batch<br/>returns delegation_id immediately];
+  Q-->X[DaemonThreadPool: child.run_conversation × N];
+  X-->E[_push_completion_event → async_delegations + completion_queue];
+  E-->W[gateway watcher / CLI idle drain];
+  W-->S[ONE synthetic turn injected into originating session];
+  M-->|no: orchestrator subagent|Y[_execute_and_aggregate joins in-turn];
+  Y-->J[json.dumps results as tool result];
+  S-->F[_finalize_child_results];
+  J-->F;</pre>
+</section>
+
+<section id="interaction">
+<h2>Live agent-to-agent I/O</h2>
+<ul>
+<li><strong>Parent → child steering</strong>: <code>steer_subagent()</code> (<code class="cite">tools/delegate_tool.py:290</code>) resolves the live registry record and calls <code>AIAgent.steer(text)</code> (<code class="cite">run_agent.py:3381</code>), which appends the text to the child's last tool result at its next iteration boundary — the in-flight tool call is never cut. A steer that wins the race after the last delivery boundary is drained into the completion entry as <code>missed_steer</code> (<code class="cite">tools/delegate_tool.py:309</code>).</li>
+<li><strong>Parent → child interrupt</strong>: cooperative flag, recursing into grandchildren; hard interrupt on timeout (<code class="cite">tools/delegate_tool.py:266</code>, <code class="cite">tools/delegate_tool.py:2814</code>).</li>
+<li><strong>Child → parent progress</strong>: <code>_build_child_progress_callback</code> (<code class="cite">tools/delegate_tool.py:1338</code>) relays child tool events with <code>subagent_id</code>, <code>parent_id</code>, <code>depth</code>, model and toolsets threaded through, so a UI can reconstruct the live spawn tree; gateway mode batches tool names, CLI mode prints tree lines.</li>
+<li><strong>Child text streaming</strong>: children stream via <code>stream_callback=_relay_child_text</code> (<code class="cite">tools/delegate_tool.py:2794</code>).</li>
+<li><strong>Model-facing control plane</strong>: <code>delegate_task(action="list"|"steer"|"stop")</code> (<code class="cite">tools/delegate_tool.py:466</code>), ownership enforced by walking the parent weakref chain (<code class="cite">tools/delegate_tool.py:380</code>).</li>
+<li><strong>Operator control plane</strong>: global spawn pause switch (<code class="cite">tools/delegate_tool.py:194</code>) driven from the TUI <code>/agents</code> panel.</li>
+<li><strong>Plugin-safe API</strong>: <code>agent/subagent_lifecycle.py</code> exposes immutable contracts and HMAC-authenticated handles instead of raw <code>AIAgent</code> objects (<code class="cite">agent/subagent_lifecycle.py:37</code>).</li>
+</ul>
+</section>
+
+<section id="rpc">
+<h2><code>execute_code</code>: RPC tool calls from Python scripts</h2>
+<p>The signature Hermes trick for collapsing multi-step pipelines: the model writes a Python script, and Hermes generates auto-stub modules whose functions call back into the parent process's real tool registry over RPC — so a fifty-call pipeline costs one inference turn and intermediate outputs never enter the context window.</p>
+<ul>
+<li><strong>Server</strong>: <code>_rpc_server_loop</code> (<code class="cite">tools/code_execution_tool.py:652</code>) runs on a thread in the parent process. Per request, in order: constant-time token check via <code>secrets.compare_digest</code> (<code class="cite">tools/code_execution_tool.py:709</code>), tool allow-list, per-execution call limit, terminal blocked-params strip, then dispatch through the standard <code>model_tools.handle_function_call(...)</code> with stdout/stderr silenced (<code class="cite">tools/code_execution_tool.py:744</code>).</li>
+<li><strong>Transports</strong>: Unix domain socket by default; TCP on 127.0.0.1 for Windows; a file-based request/response transport for remote sandbox backends (<code class="cite">tools/code_execution_tool.py:1355</code>, <code class="cite">tools/code_execution_tool.py:576</code>).</li>
+<li><strong>Child env</strong>: only <code>HERMES_RPC_SOCKET</code> + <code>HERMES_RPC_TOKEN</code> are handed over; everything else is scrubbed (<code class="cite">tools/code_execution_tool.py:1435</code>, allow-list at <code class="cite">tools/code_execution_tool.py:147</code>).</li>
+<li><strong>Budget interaction</strong>: <code>execute_code</code> iterations are <em>refunded</em> to the <code>IterationBudget</code> (<code class="cite">agent/iteration_budget.py:28</code>) — programmatic turns are free.</li>
+</ul>
+</section>
+
+<section id="other-shapes">
+<h2>Other multi-agent shapes</h2>
+<table class="grid">
+<thead><tr><th>Shape</th><th>What it is</th><th>Where</th></tr></thead>
+<tbody>
+<tr><td><strong>MoA (Mixture of Agents)</strong></td><td>Reference models fan out in parallel for one user turn; outputs are stably ordered, privacy-filtered, and fed to the primary model as advisor text.</td><td><code class="cite">agent/moa_loop.py:795</code></td></tr>
+<tr><td><strong>Background review</strong></td><td>A fully separate <code>AIAgent</code> forked at end of turn to review the work; a new turn cancels a still-running review to avoid concurrent calls on the same credentials.</td><td><code class="cite">run_agent.py:1805</code>, <code class="cite">agent/conversation_loop.py:1771</code></td></tr>
+<tr><td><strong>Kanban workers</strong></td><td>Genuine subprocess agents (<code>hermes … chat -q</code>) dispatched from a task board, inside the gateway or via <code>hermes kanban dispatch</code>.</td><td><code class="cite">hermes_cli/kanban_db.py:10876</code></td></tr>
+<tr><td><strong>Relay adapters</strong></td><td>Experimental "gateway gateway": one generic <code>RelayAdapter</code> fronted by connectors that hand over a wire-serializable <code>CapabilityDescriptor</code> at handshake — one adapter serves Discord/Telegram/Matrix/Signal without per-platform branching.</td><td><code class="cite">gateway/relay/descriptor.py:1</code></td></tr>
+<tr><td><strong>Proxy mode</strong></td><td>The gateway short-circuits a turn to a remote Hermes API server when a proxy URL is configured.</td><td><code class="cite">gateway/run.py:27794</code></td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="extension">
+<h2>Hooks, events, middleware — four distinct surfaces</h2>
+<ol>
+<li><strong>Plugin lifecycle hooks</strong> — the main surface. Allow-list <code>VALID_HOOKS</code> (<code class="cite">hermes_cli/plugins.py:156</code>) spans tool, LLM, API, session, subagent (<code>subagent_start/stop</code>), gateway, approval, transcription and Kanban events. Front door: <code>invoke_hook()</code> (<code class="cite">hermes_cli/lifecycle.py:11</code>), which fires first-party observability before plugins; <code>has_hook()</code> is the cheap short-circuit on every hot call site. Notably, <code>pre_gateway_dispatch</code> runs <em>before</em> auth so plugins can handle unauthorized senders, and slash-command observation deliberately excludes the running-agent intercept path so a hostile plugin cannot take away <code>/stop</code> (<code class="cite">hermes_cli/plugins.py:340</code>).</li>
+<li><strong>Plugin event bus</strong> — async and queued, distinct from hooks: <code>PluginManager.subscribe()</code> (<code class="cite">hermes_cli/plugins.py:3265</code>), bounded queue, single ordered daemon worker, recursion-depth cap (<code class="cite">hermes_cli/plugins.py:5270</code>).</li>
+<li><strong>Middleware</strong> — "observer hooks report what happened; middleware can change what happens" (<code class="cite">hermes_cli/middleware.py:3</code>). Kinds: <code>tool_request</code>, <code>tool_execution</code>, <code>llm_request</code>, <code>llm_execution</code>; applied in the tool path at <code class="cite">agent/tool_executor.py:540</code>.</li>
+<li><strong>Shell hooks + gateway hook registry</strong> — a <code>hooks:</code> block in <code>cli-config.yaml</code> bridges shell scripts onto the plugin hook manager with first-use consent and <code>shell=False</code> execution (<code class="cite">agent/shell_hooks.py:1</code>); separately, the gateway discovers filesystem hooks from <code>~/.hermes/hooks/*/HOOK.yaml</code> (<code class="cite">gateway/hooks.py:54</code>) whose errors never block the pipeline.</li>
+</ol>
+</section>
+
+<section id="identity">
+<h2>Cross-cutting: identity propagation</h2>
+<p><code>gateway/session_context.py</code> replaced process-global <code>os.environ["HERMES_SESSION_*"]</code> with <code>ContextVar</code>s precisely because concurrent gateway messages were overwriting each other's routing identity (<code class="cite">gateway/session_context.py:11</code>). A <code>_UNSET</code> sentinel distinguishes "never set here" (fall back to env for CLI/cron) from "explicitly cleared" (<code class="cite">gateway/session_context.py:41</code>).</p>
+<p>The consequences shape the whole codebase: <code>_handle_message</code> resets session vars on entry (<code class="cite">gateway/run.py:16255</code>); every thread hand-off copies the context explicitly — executor offload (<code class="cite">gateway/run.py:24176</code>), delegation fan-out (<code class="cite">tools/delegate_tool.py:3925</code>), MoA workers (<code class="cite">agent/moa_loop.py:850</code>); and <code>async_delivery_supported()</code> (<code class="cite">gateway/session_context.py:482</code>) is what lets <code>delegate_task</code> choose background vs inline per surface.</p>
+<div class="callout surprise"><strong>Transferable idea.</strong> "Routing identity in ContextVars with explicit copies at every thread boundary" is one of the cleanest solutions in the repo to the classic multi-tenant-agent identity-leak problem — see <a href="transfer.html">Transferables</a>.</div>
+</section>
+    </main>
+  </div>
+  <footer>
+    Hermes Agent fresh wiki · grounded 2026-08-19 against commit <code>42a4c91c4</code>
+    for <code>IgorTavcar/hermes-agent</code> (fork of <code>NousResearch/hermes-agent</code>);
+    citations are <code>path:line</code> into the working tree; diagrams render offline via vendored mermaid.
+  </footer>
+  <script>
+    const links = [...document.querySelectorAll('.sidebar a')];
+    const map = new Map(links.map(a => [a.getAttribute('href').slice(1), a]));
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          links.forEach(a => a.classList.remove('active'));
+          const a = map.get(e.target.id);
+          if (a) a.classList.add('active');
+        }
+      });
+    }, { rootMargin: '-80px 0px -70% 0px' });
+    document.querySelectorAll('main section[id]').forEach(s => obs.observe(s));
+  </script>
+</body>
+</html>

@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Providers &amp; Subscription Tiers · Hermes Fresh Wiki</title>
+  <link rel="stylesheet" href="./style.css">
+  <script defer src="./search-index.js"></script>
+  <script defer src="./wiki.js"></script>
+  <script src="./vendor/mermaid.min.js"></script>
+  <script>
+    window.addEventListener("DOMContentLoaded", function () {
+      if (!window.mermaid) return;
+      try {
+        mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "loose",
+          themeVariables: { fontFamily: "ui-monospace, monospace", fontSize: "13px",
+            primaryColor: "#171b24", primaryBorderColor: "#2d3543", primaryTextColor: "#e7ebf2",
+            lineColor: "#c9a93a", secondaryColor: "#12151c", tertiaryColor: "#0a0c10" } });
+        mermaid.run({ querySelector: "pre.mermaid" });
+      } catch (e) { console.error("mermaid render failed", e); }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="index.html"><span class="mark">☤</span> Hermes Agent <span class="sub">Fresh Wiki</span></a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="loops.html">Turn Loops</a>
+      <a href="kernels.html">LLM Kernels</a>
+      <a href="providers.html" class="active">Providers &amp; Tiers</a>
+      <a href="channels.html">Channels</a>
+      <a href="skills.html">Self-Adaptive Skills</a>
+      <a href="transfer.html">Transferables</a>
+    </nav>
+  </header>
+  <div class="layout">
+    <aside class="sidebar">
+      <p class="toc-title">On this page</p>
+      <ul>
+        <li><a href="#layers">How a provider is defined</a></li>
+        <li><a href="#files">Config &amp; credential files</a></li>
+        <li><a href="#pool">The credential pool</a></li>
+        <li><a href="#table">All providers at a glance</a></li>
+        <li><a href="#anthropic">Claude Pro/Max (subscription)</a></li>
+        <li><a href="#codex">ChatGPT / Codex (subscription)</a></li>
+        <li><a href="#grok">xAI Grok OAuth (subscription)</a></li>
+        <li><a href="#copilot">GitHub Copilot (subscription)</a></li>
+        <li><a href="#qwen">Qwen OAuth</a></li>
+        <li><a href="#minimax">MiniMax OAuth</a></li>
+        <li><a href="#nous">Nous Portal</a></li>
+        <li><a href="#antigravity">Antigravity &amp; plan-key tiers</a></li>
+        <li><a href="#surfaces">Setup surfaces</a></li>
+      </ul>
+    </aside>
+    <main>
+<div class="hero">
+<h1 class="page-title">Providers &amp; Subscription Tiers</h1>
+<p class="lead">Hermes speaks to ~40 inference providers through four API dialects. The interesting part is the "subscription contracts" — consumer subscriptions (Claude Pro/Max, ChatGPT Plus/Pro, SuperGrok, GitHub Copilot, Qwen, MiniMax Coding Plan) reused as agent inference, each requiring its own OAuth flow, token store, refresh logic, and — for some — client-identity spoofing to pass the vendor's edge. This page documents each one, one by one, grounded in the auth code.</p>
+</div>
+
+<section id="layers">
+<h2>How a provider is defined — four joined layers</h2>
+<table class="grid">
+<thead><tr><th>Layer</th><th>Owns</th><th>Where</th></tr></thead>
+<tbody>
+<tr><td><code>ProviderProfile</code> (declarative plugin)</td><td>api_mode, base_url, env_vars, auth_type, default_headers, fallback models, request quirks</td><td><code class="cite">providers/base.py:39</code></td></tr>
+<tr><td>Plugin discovery</td><td>imports <code>plugins/model-providers/&lt;name&gt;/</code>, then <code>$HERMES_HOME</code> plugins, then legacy modules</td><td><code class="cite">providers/__init__.py:271</code></td></tr>
+<tr><td><code>ProviderConfig</code> registry</td><td>the credential truth: auth_type, key env vars, base-url env var, OAuth client_id/scope</td><td><code class="cite">hermes_cli/auth.py:232</code></td></tr>
+<tr><td><code>CANONICAL_PROVIDERS</code></td><td>the slug universe shown by <code>hermes model</code></td><td><code class="cite">hermes_cli/models.py:1155</code></td></tr>
+</tbody>
+</table>
+<p>Unification happens in <code>provider_catalog.py</code> (<code class="cite">hermes_cli/provider_catalog.py:83</code>), which tags each slug with a desktop tab derived purely from its auth type. The four <strong>API dialects</strong> (<code>api_mode</code>): <code>chat_completions</code> (OpenAI wire), <code>anthropic_messages</code>, <code>codex_responses</code> (OpenAI Responses API), <code>bedrock_converse</code>. See <a href="kernels.html">LLM Kernels</a> for how each dialect actually executes.</p>
+</section>
+
+<section id="files">
+<h2>Config &amp; credential file locations</h2>
+<table class="grid">
+<thead><tr><th>Path</th><th>Contents</th></tr></thead>
+<tbody>
+<tr><td><code>~/.hermes/config.yaml</code></td><td><code>model.provider/default/base_url/api_mode</code>, <code>auxiliary.*</code>, <code>custom_providers[]</code>, <code>credential_pool_strategies</code> (<code class="cite">hermes_cli/auth.py:7387</code>)</td></tr>
+<tr><td><code>~/.hermes/.env</code></td><td>provider API keys — the canonical secret store (<code class="cite">hermes_cli/credential_lifecycle.py:1</code>)</td></tr>
+<tr><td><code>~/.hermes/auth.json</code></td><td><code>providers.&lt;id&gt;</code> OAuth singletons + <code>credential_pool.&lt;id&gt;[]</code> + <code>active_provider</code> (<code class="cite">hermes_cli/auth.py:1047</code>)</td></tr>
+<tr><td><code>~/.claude/.credentials.json</code> + macOS Keychain</td><td>Claude Code OAuth — read <em>and written back</em> by Hermes (<code class="cite">agent/anthropic_adapter.py:1046</code>)</td></tr>
+<tr><td><code>~/.codex/auth.json</code></td><td>Codex CLI tokens — read-only for Hermes (<code class="cite">hermes_cli/auth.py:4052</code>)</td></tr>
+<tr><td><code>~/.qwen/oauth_creds.json</code></td><td>Qwen CLI OAuth — read <em>and written back</em> (<code class="cite">hermes_cli/auth.py:2664</code>)</td></tr>
+<tr><td><code>~/.hermes/.copilot_jwt.json</code></td><td>exchanged Copilot JWT cache (<code class="cite">hermes_cli/copilot_auth.py:328</code>)</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="pool">
+<h2>The credential pool (multi-account rotation)</h2>
+<p>Every provider gets a pool keyed by slug (<code class="cite">agent/credential_pool.py:164</code>), auth types <code>oauth</code>/<code>api_key</code>, sources like <code>manual</code>, <code>env:&lt;VAR&gt;</code>, <code>claude_code</code>, <code>hermes_pkce</code>, <code>device_code</code>, <code>gh_cli</code>, <code>qwen-cli</code>. Rotation strategies are <code>fill_first | round_robin | random | least_used</code>. Per-provider refresh dispatch lives in <code>_refresh_entry_impl</code> (<code class="cite">agent/credential_pool.py:1365</code>); Codex and xAI refreshes are wrapped in a cross-process <code>auth.json</code> flock because their refresh tokens are single-use (<code class="cite">agent/credential_pool.py:1313</code>).</p>
+</section>
+
+<section id="table">
+<h2>All providers at a glance</h2>
+<p>~40 providers across the four dialects and six auth types. The subscription-tier ones — where a consumer plan drives agent inference — are marked <strong>★</strong>.</p>
+<div style="overflow-x:auto">
+<table class="grid">
+<thead><tr><th>Slug</th><th>Dialect</th><th>Auth</th><th>Tier?</th></tr></thead>
+<tbody>
+<tr><td><code>nous</code> — Nous Portal</td><td>chat_completions</td><td>oauth_device_code</td><td>★ Nous plan</td></tr>
+<tr><td><code>anthropic</code></td><td>anthropic_messages</td><td>api_key + OAuth</td><td>★ Claude Pro/Max</td></tr>
+<tr><td><code>openai-codex</code></td><td>codex_responses</td><td>oauth_external</td><td>★ ChatGPT Plus/Pro</td></tr>
+<tr><td><code>openai-api</code></td><td>codex_responses</td><td>api_key</td><td>—</td></tr>
+<tr><td><code>xai-oauth</code></td><td>codex_responses</td><td>oauth_external</td><td>★ SuperGrok / X Premium+</td></tr>
+<tr><td><code>xai</code></td><td>codex_responses</td><td>api_key</td><td>—</td></tr>
+<tr><td><code>copilot</code></td><td>per-model</td><td>copilot (GitHub OAuth→JWT)</td><td>★ Copilot Ind/Bus/Ent</td></tr>
+<tr><td><code>copilot-acp</code></td><td>chat_completions (subprocess)</td><td>external_process</td><td>★ via <code>copilot</code> CLI</td></tr>
+<tr><td><code>qwen-oauth</code></td><td>chat_completions</td><td>oauth_external</td><td>★ Qwen Portal tier</td></tr>
+<tr><td><code>minimax-oauth</code></td><td>anthropic_messages</td><td>oauth_minimax</td><td>★ MiniMax Coding Plan</td></tr>
+<tr><td><code>zai</code> — GLM</td><td>chat_completions</td><td>api_key</td><td>partly — GLM Coding Plan</td></tr>
+<tr><td><code>kimi-coding</code></td><td>chat_completions</td><td>api_key</td><td>partly — Kimi Coding Plan</td></tr>
+<tr><td><code>alibaba-coding-plan</code></td><td>chat_completions</td><td>api_key</td><td>partly — Coding Plan</td></tr>
+<tr><td><code>stepfun</code></td><td>chat_completions</td><td>api_key</td><td>partly — Step Plan</td></tr>
+<tr><td><code>opencode-go</code></td><td>per-model</td><td>api_key</td><td>partly — $10/mo key</td></tr>
+<tr><td><code>gemini</code>, <code>vertex</code>, <code>bedrock</code>, <code>azure-foundry</code></td><td>varies</td><td>api_key / GCP / AWS / Entra</td><td>—</td></tr>
+<tr><td colspan="4">…plus <code>fireworks</code>, <code>openrouter</code>, <code>novita</code>, <code>lmstudio</code>, <code>deepseek</code>, <code>huggingface</code>, <code>nvidia</code>, <code>ollama-cloud</code>, <code>deepinfra</code>, <code>ai-gateway</code>, <code>kilocode</code>, <code>arcee</code>, <code>gmi</code>, <code>xiaomi</code>, <code>meta-ai</code>, <code>upstage</code>, <code>custom</code> … (all plain api_key)</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout warn"><strong>Terms of service.</strong> Subscription-OAuth providers route a real consumer subscription through agent traffic. Confirm such usage is within each provider's terms before relying on it in production — Hermes provides the transport, not the entitlement.</div>
+</section>
+
+<section id="anthropic">
+<h2>Claude Pro / Max — the deepest subscription integration</h2>
+<p>Slug <code>anthropic</code>, base <code>https://api.anthropic.com</code>, <code>anthropic_messages</code> dialect. A token's prefix decides its auth: <code>sk-ant-api*</code> → API key (<code>x-api-key</code>); <code>sk-ant-*</code>/JWT/<code>cc-*</code> → OAuth (Bearer) (<code class="cite">agent/anthropic_adapter.py:414</code>). Resolution priority runs env vars → the Claude Code credential store (Keychain / <code>~/.claude/.credentials.json</code>, refreshed if expired) → the credential pool (<code class="cite">agent/anthropic_adapter.py:1391</code>).</p>
+<p><strong>OAuth client &amp; refresh</strong> (<code class="cite">agent/anthropic_adapter.py:1496</code>):</p>
+<pre><code>client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+_OAUTH_TOKEN_URLS = ["https://platform.claude.com/v1/oauth/token",
+                     "https://console.anthropic.com/v1/oauth/token"]
+_OAUTH_TOKEN_USER_AGENT = "axios/1.7.9"    # deliberate spoof</code></pre>
+<p>The <code>axios/1.7.9</code> UA is deliberate and documented: Anthropic rate-limits (429) any token-endpoint request whose UA starts with <code>claude-code/</code>, and the real CLI exchanges the code with a bare axios client (<code class="cite">agent/anthropic_adapter.py:1506</code>). Hermes writes refreshed tokens back to <code>~/.claude/.credentials.json</code> atomically at mode 0600, preserving <code>scopes</code> because Claude Code ≥2.1.81 gates on the presence of <code>user:inference</code> (<code class="cite">agent/anthropic_adapter.py:1246</code>).</p>
+<p><strong>How Hermes presents itself as Claude Code</strong> at runtime (<code class="cite">agent/anthropic_adapter.py:908</code>): <code>user-agent: claude-code/&lt;detected-cli-version&gt; (external, cli)</code>, <code>x-app: cli</code>, the OAuth-only beta headers, a prepended "You are Claude Code…" system block, product-name scrubbing (<code>Hermes Agent→Claude Code</code>, <code>Nous Research→Anthropic</code>), and tool-name rewriting to the <em>double</em>-underscore <code>mcp__</code> form — a single-underscore name trips Anthropic's subscription-billing classifier into an HTTP 400 (<code class="cite">agent/anthropic_adapter.py:2971</code>). Usage is read from <code>/api/oauth/usage</code>, mapping <code>five_hour</code>/<code>seven_day</code> windows plus extra-usage credits (<code class="cite">agent/account_usage.py:751</code>).</p>
+<p><strong>Setup</strong>: <code>hermes model</code> → Anthropic → "Claude Pro/Max subscription (OAuth login)" runs <code>claude setup-token</code> as a subprocess and prefers <em>linking</em> the Claude Code store over copying a token (<code class="cite">hermes_cli/model_setup_flows.py:3115</code>). Hermes also ships its own PKCE flow — <code>hermes auth add anthropic --type oauth</code> — landing tokens in the pool with source <code>manual:hermes_pkce</code> (<code class="cite">agent/anthropic_adapter.py:1535</code>).</p>
+<div class="callout info"><strong>GUI mis-tab (worth knowing).</strong> The registry marks <code>anthropic</code> <code>auth_type="api_key"</code> even though OAuth is its primary subscription path, so it lands on the desktop "keys" tab; a hand-written <code>claude-code</code> accounts card compensates (<code class="cite">hermes_cli/auth.py:396</code>).</div>
+</section>
+
+<section id="codex">
+<h2>ChatGPT / Codex subscription (<code>openai-codex</code>)</h2>
+<p>Base <code>https://chatgpt.com/backend-api/codex</code>, <code>codex_responses</code> dialect, <code>oauth_external</code>. Login is a device-code flow (<code class="cite">hermes_cli/auth.py:8204</code>):</p>
+<pre><code>CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+CODEX_OAUTH_USER_AGENT = f"hermes-cli/{__version__}"</code></pre>
+<p>The user opens <code>auth.openai.com/codex/device</code>, enters the code, and Hermes polls, then exchanges the authorization code. Tokens live at <code>auth.json → providers.openai-codex.tokens</code>; Hermes only <em>reads</em> <code>~/.codex/auth.json</code>, never writes it (<code class="cite">hermes_cli/auth.py:3830</code>). Refresh has a 429→<code>CODEX_RATE_LIMITED</code> path that keeps credentials valid, and a bespoke <code>refresh_token_reused</code> diagnostic when Codex CLI/VS Code consumed the single-use token (<code class="cite">hermes_cli/auth.py:3874</code>).</p>
+<p><strong>Edge-spoofing</strong> is required to pass Cloudflare in front of the Codex backend (<code class="cite">agent/auxiliary_client.py:1214</code>):</p>
+<pre><code>"User-Agent": "codex_cli_rs (Hermes Agent)",
+"originator": "codex_cli_rs",
+# + ChatGPT-Account-ID decoded from the OAuth JWT's chatgpt_account_id claim</code></pre>
+<p>Non-residential IPs without an allowed originator get 403 <code>cf-mitigated: challenge</code>. Models are fetched live from <code>/codex/models</code> (<code class="cite">hermes_cli/codex_models.py:122</code>); the fallback list includes the <code>gpt-5.6-*</code>/<code>gpt-5.x-codex</code> families. A banked-reset feature (<code>/usage reset</code>) redeems a credit to restore full 5h+weekly limits (<code class="cite">agent/account_usage.py:587</code>). Multi-account: <code>hermes auth add openai-codex</code> creates an independent pool entry per ChatGPT account rather than collapsing them (<code class="cite">hermes_cli/auth_commands.py:310</code>).</p>
+</section>
+
+<section id="grok">
+<h2>xAI Grok OAuth — SuperGrok / X Premium+ (<code>xai-oauth</code>)</h2>
+<p>Base <code>https://api.x.ai/v1</code>, <code>codex_responses</code> transport, <code>oauth_external</code>. OIDC device-code flow (<code class="cite">hermes_cli/auth.py:8134</code>):</p>
+<pre><code>XAI_OAUTH_ISSUER = "https://auth.x.ai"
+XAI_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
+XAI_OAUTH_SCOPE = "openid profile email offline_access grok-cli:access api:access"
+XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 3600   # tokens ~6h; refresh 1h early</code></pre>
+<p>Refresh re-validates the cached <code>token_endpoint</code> against xAI's domain on every use — an <code>auth.json</code> written by an older Hermes could carry a non-xAI endpoint that would receive every future refresh token in plaintext (<code class="cite">hermes_cli/auth.py:4961</code>). A 403 gets a dedicated <code>xai_oauth_tier_denied</code> message rather than a re-login prompt: xAI may restrict API/OAuth use to specific SuperGrok tiers despite an active in-app subscription (<code class="cite">hermes_cli/auth.py:4987</code>). Unlike the others, xAI OAuth uses <strong>no spoofing</strong> — Hermes identifies honestly as <code>Hermes-Agent/&lt;version&gt;</code> (<code class="cite">tools/xai_http.py:95</code>). Setup: <code>hermes model</code> → xAI Grok → OAuth, or <code>hermes auth add xai-oauth</code>.</p>
+</section>
+
+<section id="copilot">
+<h2>GitHub Copilot — subscription via GitHub OAuth → short-lived JWT</h2>
+<p>Base <code>https://api.githubcopilot.com</code>, dialect resolved <em>per model</em> (GPT-5+/Codex → responses, Claude → anthropic, rest → chat). Only <code>gho_</code>/<code>github_pat_</code>/<code>ghu_</code> tokens are accepted — classic <code>ghp_</code> is rejected (<code class="cite">hermes_cli/copilot_auth.py:41</code>). The device-code login uses <strong>VS Code's</strong> GitHub App client id, deliberately, because the old opencode App id produces tokens that can't be exchanged for Copilot JWTs (<code class="cite">hermes_cli/copilot_auth.py:34</code>):</p>
+<pre><code>COPILOT_OAUTH_CLIENT_ID = "Iv1.b507a08c87ecfe98"</code></pre>
+<p>The "subscription contract" is the token exchange (<code class="cite">hermes_cli/copilot_auth.py:480</code>): a GET to <code>copilot_internal/v2/token</code> with <code>Editor-Version: vscode/1.104.1</code> returns a short-lived, semicolon-separated token plus the enterprise API endpoint, cached in-process and at <code>~/.hermes/.copilot_jwt.json</code>, refreshed 120&nbsp;s before expiry. Requests spoof the editor: <code>Editor-Version: vscode/1.104.1</code>, <code>User-Agent: HermesAgent/1.0</code>, <code>Copilot-Integration-Id: vscode-chat</code>, <code>x-initiator: agent|user</code> (<code class="cite">hermes_cli/copilot_auth.py:683</code>). The sibling <code>copilot-acp</code> delegates auth entirely to a local <code>copilot --acp</code> subprocess logged in via <code>copilot /login</code> (<code class="cite">hermes_cli/model_setup_flows.py:1998</code>).</p>
+</section>
+
+<section id="qwen">
+<h2>Qwen OAuth — borrowed Qwen CLI subscription (<code>qwen-oauth</code>)</h2>
+<p>Base <code>https://portal.qwen.ai/v1</code>. Hermes has <em>no login flow of its own</em>: it reads <code>~/.qwen/oauth_creds.json</code> written by <code>qwen auth qwen-oauth</code> and refuses with an instruction if absent (<code class="cite">hermes_cli/auth.py:2664</code>). Refresh POSTs to <code>chat.qwen.ai/api/v1/oauth2/token</code> with <code>client_id="f0304373b74a44d2b584a3fb70ca9e56"</code>, and writes the rotated pair back to the Qwen CLI's own file at 0600. Headers spoof the Qwen Code CLI: <code>User-Agent: QwenCode/0.14.1 …</code> plus DashScope headers (<code class="cite">run_agent.py:335</code>).</p>
+</section>
+
+<section id="minimax">
+<h2>MiniMax OAuth — Coding Plan (<code>minimax-oauth</code>)</h2>
+<p><code>anthropic_messages</code> dialect against <code>.../anthropic</code>. PKCE user-code flow (<code class="cite">hermes_cli/auth.py:8611</code>): <code>client_id="78257093-7e40-4613-99e0-527b14b39113"</code>, scope <code>"group_id profile model.completion"</code>, region-aware portals (global/CN). Tokens land in <code>auth.json → providers.minimax-oauth</code>; setup via <code>hermes model</code> → MiniMax → OAuth or <code>hermes auth add minimax-oauth --region cn|global</code>.</p>
+</section>
+
+<section id="nous">
+<h2>Nous Portal — first-party subscription (<code>nous</code>)</h2>
+<p>Device-code OAuth against <code>portal.nousresearch.com</code>, <code>client_id="hermes-cli"</code>, scope <code>inference:invoke</code> (<code class="cite">hermes_cli/auth.py:250</code>). The access token doubles as the inference JWT, validated by scope + TTL before use. A <code>subscription_required</code> error at login prints the billing URL; entitlement/feature mapping lives in <code>hermes_cli/nous_subscription.py</code>. Cross-profile sharing goes through <code>&lt;root&gt;/shared/nous_auth.json</code>. Nous is dual-wire — <code>anthropic/*</code> catalog ids route to <code>/v1/messages</code>, everything else to <code>/v1/chat/completions</code> (<code class="cite">hermes_cli/providers.py:691</code>).</p>
+</section>
+
+<section id="antigravity">
+<h2>Antigravity &amp; the plan-key tiers</h2>
+<p><strong>Google Antigravity is not a provider in this tree.</strong> It exists only as an optional <em>skill</em> wrapping the local <code>agy</code> CLI — the skill's own note says it "does not wrap a network API, so there is nothing to authenticate from Hermes itself" (<code class="cite">optional-skills/autonomous-ai-agents/antigravity-cli/SKILL.md:17</code>).</p>
+<p>Several vendors sell subscription <em>plans</em> that are consumed through a plain API key with special endpoint routing, so Hermes treats them as <code>api_key</code> providers:</p>
+<ul>
+<li><strong>Z.AI / GLM Coding Plan</strong>: four official endpoints probed in priority order (a key that works on one returns "Insufficient balance" on another), winner cached by a key hash (<code class="cite">hermes_cli/auth.py:732</code>).</li>
+<li><strong>Kimi / Moonshot Coding Plan</strong>: <code>sk-kimi-</code> keys auto-route to <code>api.kimi.com/coding</code>; on that host Hermes sends honest attribution headers rather than a spoof, at the Kimi team's request (<code class="cite">agent/anthropic_adapter.py:875</code>).</li>
+<li><strong>Alibaba Coding Plan</strong>, <strong>StepFun Step Plan</strong>, <strong>OpenCode Go</strong> ($10/mo key) — all dedicated endpoints keyed by a plan-tier API key.</li>
+</ul>
+</section>
+
+<section id="surfaces">
+<h2>Setup surfaces</h2>
+<p><code>hermes model</code> builds the provider picker from <code>CANONICAL_PROVIDERS</code> folded through groups (e.g. the "openai" group holds both <code>openai-codex</code> and <code>openai-api</code>); every subscription provider has a bespoke flow, everything else falls through to a generic API-key flow (<code class="cite">hermes_cli/main.py:3913</code>). <code>hermes auth</code> covers <code>add | list | remove | reset | status | logout</code>, with the OAuth-capable set fixed at <code>{anthropic, nous, openai-codex, xai-oauth, qwen-oauth, minimax-oauth}</code> (<code class="cite">hermes_cli/auth_commands.py:37</code>). Removal dispatches to per-source teardown steps that decide suppress-vs-delete: Claude Code's file is suppressed, never deleted; Hermes-PKCE tokens are deleted outright (<code class="cite">agent/credential_sources.py:202</code>). The single choke point for saving/removing an API key across the three stores (<code>.env</code>, pool, config mirror) is <code>hermes_cli/credential_lifecycle.py</code>, whose contract only prunes <code>env:</code>-sourced entries and never touches OAuth blocks.</p>
+
+<pre class="mermaid">graph TD;
+  U[hermes model / hermes auth add]-->F{provider type};
+  F-->|API key|K[save to ~/.hermes/.env + config mirror];
+  F-->|subscription OAuth|O[device-code / PKCE / borrow CLI creds];
+  O-->S[tokens -> auth.json providers.slug + credential_pool];
+  S-->R[per-provider refresh: single-use flock for codex/xai];
+  R-->H[runtime: spoof client identity where required];
+  H-->I[inference call];
+  K-->I;</pre>
+<div class="callout key"><strong>Where Hermes actively impersonates another client.</strong> Only five: Anthropic OAuth (<code>claude-code</code> UA + system prompt + product scrubbing + <code>mcp__</code> renaming + <code>axios/1.7.9</code> at the token endpoint), Codex (<code>codex_cli_rs</code> originator), Copilot (<code>vscode/1.104.1</code> + <code>GitHubCopilotChat</code>), and Qwen (<code>QwenCode/0.14.1</code>). xAI, Nous, MiniMax and every API-key provider identify honestly as Hermes.</div>
+</section>
+    </main>
+  </div>
+  <footer>
+    Hermes Agent fresh wiki · grounded 2026-08-19 against commit <code>42a4c91c4</code>
+    for <code>IgorTavcar/hermes-agent</code> (fork of <code>NousResearch/hermes-agent</code>);
+    citations are <code>path:line</code> into the working tree; diagrams render offline via vendored mermaid.
+  </footer>
+  <script>
+    const links = [...document.querySelectorAll('.sidebar a')];
+    const map = new Map(links.map(a => [a.getAttribute('href').slice(1), a]));
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          links.forEach(a => a.classList.remove('active'));
+          const a = map.get(e.target.id);
+          if (a) a.classList.add('active');
+        }
+      });
+    }, { rootMargin: '-80px 0px -70% 0px' });
+    document.querySelectorAll('main section[id]').forEach(s => obs.observe(s));
+  </script>
+</body>
+</html>
