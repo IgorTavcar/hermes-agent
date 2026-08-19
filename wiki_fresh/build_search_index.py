@@ -18,6 +18,7 @@ PAGES = [
     ("kernels.html", "LLM Kernels"),
     ("providers.html", "Providers & Tiers"),
     ("channels.html", "Channels"),
+    ("multimodal.html", "Multimodal I/O"),
     ("skills.html", "Self-Adaptive Skills"),
     ("transfer.html", "Transferables"),
 ]

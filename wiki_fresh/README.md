@@ -25,6 +25,7 @@ ideas, know-how) to another agent harness."
 | `kernels.html` | The LLM client/adapter layer per dialect — SDKs wrapped, request/tool conversion, streaming, prompt caching, reasoning params |
 | `providers.html` | The provider catalog and, one by one, the subscription-tier OAuth integrations (Claude Pro/Max, ChatGPT/Codex, Grok, Copilot, Qwen, MiniMax, Nous) |
 | `channels.html` | Channel setup — Telegram, WhatsApp (Baileys & Cloud API), Twilio SMS, plus Discord/Slack/Signal, with real config keys |
+| `multimodal.html` | Explicit multimodal support in code — Text→Image (`image_generate` + provider registry), Image→Text (native vision routing + `vision_analyze`), Text→Audio (`text_to_speech` + streaming TTS), Audio→Text (the gateway STT pipeline), the shared media plane, and what is *not* in core |
 | `skills.html` | The self-adaptive skills machinery — creation trigger, review fork, ownership guards, memory nudges, session search, Honcho, curator |
 | `transfer.html` | The transferable ideas index — best methods/algorithms/know-how, by the scarce resource each defends, with what to lift first |
 

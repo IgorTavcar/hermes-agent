@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Multimodal I/O · Hermes Fresh Wiki</title>
+  <link rel="stylesheet" href="./style.css">
+  <script defer src="./search-index.js"></script>
+  <script defer src="./wiki.js"></script>
+  <script src="./vendor/mermaid.min.js"></script>
+  <script>
+    window.addEventListener("DOMContentLoaded", function () {
+      if (!window.mermaid) return;
+      try {
+        mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "loose",
+          themeVariables: { fontFamily: "ui-monospace, monospace", fontSize: "13px",
+            primaryColor: "#171b24", primaryBorderColor: "#2d3543", primaryTextColor: "#e7ebf2",
+            lineColor: "#c9a93a", secondaryColor: "#12151c", tertiaryColor: "#0a0c10" } });
+        mermaid.run({ querySelector: "pre.mermaid" });
+      } catch (e) { console.error("mermaid render failed", e); }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="index.html"><span class="mark">☤</span> Hermes Agent <span class="sub">Fresh Wiki</span></a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="loops.html">Turn Loops</a>
+      <a href="kernels.html">LLM Kernels</a>
+      <a href="providers.html">Providers &amp; Tiers</a>
+      <a href="channels.html">Channels</a>
+      <a href="multimodal.html" class="active">Multimodal I/O</a>
+      <a href="skills.html">Self-Adaptive Skills</a>
+      <a href="transfer.html">Transferables</a>
+    </nav>
+  </header>
+  <div class="layout">
+    <aside class="sidebar">
+      <p class="toc-title">On this page</p>
+      <ul>
+        <li><a href="#matrix">Capability matrix</a></li>
+        <li><a href="#flow">Media through the system</a></li>
+        <li><a href="#text2image">Text → Image</a></li>
+        <li><a href="#image2text">Image → Text</a></li>
+        <li><a href="#text2audio">Text → Audio (TTS)</a></li>
+        <li><a href="#audio2text">Audio → Text (STT)</a></li>
+        <li><a href="#mediaplane">The shared media plane</a></li>
+        <li><a href="#gaps">What is <em>not</em> in core</a></li>
+        <li><a href="#config">Config &amp; env quick reference</a></li>
+      </ul>
+    </aside>
+    <main>
+<div class="hero">
+<h1 class="page-title">Multimodal I/O — Images &amp; Audio</h1>
+<p class="lead">Hermes has explicit, first-class code for all four text↔media directions: <strong>Text→Image</strong> (an <code>image_generate</code> tool over a pluggable provider registry), <strong>Image→Text</strong> (native vision attachment with a <code>vision_analyze</code> fallback, chosen per model), <strong>Text→Audio</strong> (a <code>text_to_speech</code> tool with ~12 built-in providers plus sentence-streaming PCM), and <strong>Audio→Text</strong> (a transcription stack the <em>harness</em> invokes on inbound voice notes — deliberately not a model tool). This page maps each stack to its actual code, and marks precisely where core support ends and skills/plugins take over.</p>
+</div>
+
+<section id="matrix">
+<h2>Capability matrix</h2>
+<table class="grid">
+<thead><tr><th>Capability</th><th>Status</th><th>Model-facing surface</th><th>Core entry point</th></tr></thead>
+<tbody>
+<tr><td><strong>Text → Image</strong></td><td><span class="badge yes">core tool</span></td><td><code>image_generate</code> (toolset <code>image_gen</code>, <code class="cite">toolsets.py:146</code>)</td><td><code class="cite">tools/image_generation_tool.py:1453</code> + provider ABC <code class="cite">agent/image_gen_provider.py:64</code></td></tr>
+<tr><td><strong>Image → Text</strong></td><td><span class="badge yes">core, dual-mode</span></td><td>native <code>image_url</code> parts <em>or</em> <code>vision_analyze</code> (toolset <code>vision</code>)</td><td>router <code class="cite">agent/image_routing.py:468</code>, tool <code class="cite">tools/vision_tools.py:1713</code></td></tr>
+<tr><td><strong>Text → Audio</strong></td><td><span class="badge yes">core tool</span></td><td><code>text_to_speech</code> (toolset <code>tts</code>, <code class="cite">toolsets.py:230</code>)</td><td><code class="cite">tools/tts_tool.py:4451</code> + provider ABC <code class="cite">agent/tts_provider.py:64</code></td></tr>
+<tr><td><strong>Audio → Text</strong></td><td><span class="badge yes">core, harness-invoked</span></td><td><em>none by design</em> — model sees the injected transcript</td><td><code>transcribe_audio()</code> <code class="cite">tools/transcription_tools.py:3153</code></td></tr>
+<tr><td>Text → Video</td><td><span class="badge partial">core tool</span></td><td><code>video_generate</code> + BFL FLUX.3 / xAI video tools</td><td><code class="cite">tools/video_generation_tool.py:595</code>, <code class="cite">tools/flux3_video_tool.py:1185</code></td></tr>
+<tr><td>OCR</td><td><span class="badge no">not in core</span></td><td>prompt-driven: <code>pdftoppm</code> + <code>vision_analyze</code></td><td>coverage warning <code class="cite">tools/read_extract.py:297</code>; skills only</td></tr>
+<tr><td>Text → Music</td><td><span class="badge no">not in core</span></td><td>—</td><td>optional skills only (audiocraft, Suno prompting)</td></tr>
+</tbody>
+</table>
+<div class="callout key"><strong>The design split worth noticing.</strong> Generation directions (image, speech) are <em>agent tools</em> the model calls; understanding directions (vision, transcription) are <em>harness capabilities</em> applied to inbound media before or around the model. STT in particular has no registry entry at all — the dispatcher <code class="cite">tools/transcription_tools.py:2987</code> is reached only from the gateway, voice mode, wake word, the dashboard, and plugins.</div>
+</section>
+
+<section id="flow">
+<h2>Media through the system</h2>
+<pre class="mermaid">graph TD;
+  P[inbound photo] --> IC[cache_image_from_bytes/url: magic-byte gate];
+  V[inbound voice note] --> AC[cache_audio_from_bytes/url: container sniff];
+  IC --> M{agent.image_input_mode};
+  M -->|native| NP[base64 image_url content parts];
+  M -->|text| VD[vision_analyze -> bracketed description];
+  AC --> ST[transcribe_audio via STT provider chain];
+  ST --> Q[transcript injected as quoted line];
+  NP --> L[turn loop];
+  VD --> L;
+  Q --> L;
+  L -->|tool call| IG[image_generate -> cache/images];
+  L -->|tool call| TT[text_to_speech -> mp3/ogg];
+  L -->|streaming deltas| SC[StreamingTTSConsumer -> PCM frames];
+  IG --> SI[adapter send_image / MEDIA: tags];
+  TT --> SV[adapter send_voice];
+  SC --> VC[voice channel / websocket playback];</pre>
+<p>Inbound: platform adapters download photos and voice notes into <code>cache/images</code> / <code>cache/audio</code> (<code class="cite">gateway/platforms/base.py:854</code>, <code class="cite">gateway/platforms/base.py:1005</code>), then <code>_prepare_inbound_message_text</code> classifies attachments (<code class="cite">gateway/run.py:17860</code>, image test at <code class="cite">gateway/run.py:2967</code>, STT-eligibility test at <code class="cite">gateway/run.py:2990</code>) and enriches the message. Outbound: the model's replies can carry <code>MEDIA:</code> path tags parsed by <code>extract_media</code> (<code class="cite">gateway/platforms/base.py:4884</code>), and the gateway can auto-speak replies as voice notes.</p>
+</section>
+
+<section id="text2image">
+<h2>Text → Image: <code>image_generate</code></h2>
+<p>One unified tool covers text-to-image <em>and</em> image-to-image: passing <code>image_url</code> / <code>reference_image_urls</code> routes to the provider's edit endpoint (schema <code class="cite">tools/image_generation_tool.py:1453</code>; params <code>prompt</code>, <code>aspect_ratio</code>, <code>image_url</code>, <code>reference_image_urls</code>, <code>upscale</code>). The tool description is <strong>rebuilt per turn</strong> from the active provider's <code>capabilities()</code> — the model is told whether editing is available and how many reference images the backend accepts (<code class="cite">tools/image_generation_tool.py:1931</code>).</p>
+<p>Providers implement the <code>ImageGenProvider</code> ABC (<code>name</code>, <code>is_available</code>, <code>list_models</code>, <code>capabilities</code>, <code>generate</code> — <code class="cite">agent/image_gen_provider.py:64</code>) and register through the plugin hook <code>register_image_gen_provider</code> (<code class="cite">hermes_cli/plugins.py:2318</code>). Selection is <code>image_gen.provider</code> in config (<code class="cite">cli-config.yaml.example:1418</code>). Ephemeral provider URLs (xAI, OpenAI) are materialized into <code>$HERMES_HOME/cache/images/</code> so channel delivery outlives the URL (<code class="cite">agent/image_gen_provider.py:278</code>).</p>
+<table class="grid">
+<thead><tr><th>Backend</th><th>Where</th><th>Default model / notes</th><th>Credential</th></tr></thead>
+<tbody>
+<tr><td>FAL (built-in catalog)</td><td><code class="cite">tools/image_generation_tool.py:101</code>, plugin shim <code class="cite">plugins/image_gen/fal/__init__.py:40</code></td><td>20-model <code>FAL_MODELS</code> catalog; default <code>fal-ai/flux-2/klein/9b</code> (<code class="cite">tools/image_generation_tool.py:668</code>); flux-2-pro, nano-banana-2, gpt-image-1.5/2, ideogram v3/v4, recraft v4, qwen-image, seedream v5, mai-image-2.5-pro…; upscale via <code>fal-ai/clarity-upscaler</code></td><td><code>FAL_KEY</code> (<code class="cite">.env.example:167</code>) or Nous managed gateway</td></tr>
+<tr><td>OpenAI</td><td><code class="cite">plugins/image_gen/openai/__init__.py:165</code></td><td><code>gpt-image-2</code> tiers (default <code>gpt-image-2-medium</code>); <code>images.generate</code> / <code>images.edit</code>, up to 16 source images</td><td><code>OPENAI_API_KEY</code></td></tr>
+<tr><td>OpenAI-Codex</td><td><code class="cite">plugins/image_gen/openai-codex/__init__.py:457</code></td><td>gpt-image-2 through the Codex Responses hosted <code>image_generation</code> tool — rides the ChatGPT subscription OAuth, no API key</td><td>Codex OAuth</td></tr>
+<tr><td>xAI</td><td><code class="cite">plugins/image_gen/xai/__init__.py:159</code></td><td><code>grok-imagine-image</code>; edits via <code>/images/edits</code></td><td><code>XAI_API_KEY</code> / xAI OAuth</td></tr>
+<tr><td>OpenRouter</td><td><code class="cite">plugins/image_gen/openrouter/__init__.py:176</code></td><td>image models over <code>/chat/completions</code>; default <code>openai/gpt-5.4-image-2</code>, fallback <code>google/gemini-3-pro-image</code></td><td><code>OPENROUTER_API_KEY</code> / Nous Portal</td></tr>
+<tr><td>DeepInfra</td><td><code class="cite">plugins/image_gen/deepinfra/__init__.py:126</code></td><td>catalog discovered live from the API filtered by the <code>image-gen</code> tag — nothing hardcoded</td><td><code>DEEPINFRA_API_KEY</code></td></tr>
+<tr><td>Krea</td><td><code class="cite">plugins/image_gen/krea/__init__.py:350</code></td><td>Krea 2 large/medium/medium-turbo, async job submit + poll, built-in enhance/upscale</td><td><code>KREA_API_KEY</code> or managed</td></tr>
+</tbody>
+</table>
+<p>Two hardening details transfer well: <code>_confine_source_images</code> blocks a sandboxed agent from feeding credential files or arbitrary host paths into the edit endpoint (<code class="cite">tools/image_generation_tool.py:1817</code>), and the result post-processor emits an <code>agent_visible_image</code> path when the terminal backend's filesystem differs from the host's (<code class="cite">tools/image_generation_tool.py:1095</code>). The same ABC/registry pattern repeats for video (<code>video_generate</code>, <code class="cite">tools/video_generation_tool.py:595</code>) and powers the desktop pet's sprite generation (<code class="cite">agent/pet/generate/imagegen.py:1</code>). Creative <em>skills</em> (comfyui, meme-generation, pixel-art…) sit on top of the tool, not beside it.</p>
+</section>
+
+<section id="image2text">
+<h2>Image → Text: native attachment vs. pre-description</h2>
+<p>Every image that reaches the agent goes through one routing decision: <code>decide_image_input_mode()</code> returns <code>"native"</code> (attach pixels as content parts) or <code>"text"</code> (pre-describe with a vision model) (<code class="cite">agent/image_routing.py:468</code>). Config is <code>agent.image_input_mode: auto|native|text</code>; in <code>auto</code> it attaches natively when the model reports <code>supports_vision</code> (resolution order: explicit model config → provider model config → the models.dev catalog, <code class="cite">agent/image_routing.py:180</code>) and falls back to text otherwise. Native parts are OpenAI-style base64 <code>image_url</code> data URLs built by <code>build_native_content_parts</code> (<code class="cite">agent/image_routing.py:735</code>), with magic-byte MIME sniffing and Pillow transcode-to-PNG for formats Anthropic rejects (AVIF/HEIC/BMP/TIFF, <code class="cite">agent/image_routing.py:598</code>).</p>
+<p>The <strong><code>vision_analyze</code></strong> tool is the workhorse of the text path and also a standalone tool the model can call on any image path/URL, with an optional <code>region</code> crop (<code class="cite">tools/vision_tools.py:1713</code>). It has two internal modes: a <em>native fast path</em> that returns a <code>{"_multimodal": true, "content": […image parts…]}</code> envelope so the main model sees the pixels in the tool result (gated by a provider allowlist, <code class="cite">tools/vision_tools.py:967</code>), and a legacy path that asks the auxiliary vision model (<code>auxiliary.vision.model</code>) to describe the image (<code class="cite">tools/vision_tools.py:1299</code>). Supporting machinery: progressive resize to a 4&nbsp;MB embed target (<code class="cite">tools/vision_tools.py:796</code>), SVG rasterization through a four-tool fallback chain (<code class="cite">tools/vision_tools.py:277</code>), a bounded CPU pool for encode/resize added after a video-frame fan-out starved the event loop (<code class="cite">tools/vision_tools.py:181</code>), and a 50&nbsp;MB download cap.</p>
+<div class="callout warn"><strong>Security boundary.</strong> All media ingestion funnels through <code>resolve_image_source</code> (<code class="cite">tools/image_source.py:49</code> ff.): SSRF checks on URLs, a media-cache-roots allowlist for host paths, and container-exec confinement — the fix for GHSA-gpxw-6wxv-w3qq, where a prompt-injected <code>vision_analyze('/etc/passwd')</code> could read host files.</div>
+<p><strong>Dialect translation.</strong> The transports rewrite <code>image_url</code> parts per dialect: Anthropic <code>{"type":"image","source":…}</code> blocks (<code class="cite">agent/anthropic_adapter.py:1849</code>), Gemini <code>inline_data</code> (<code class="cite">agent/gemini_native_adapter.py:284</code>), Bedrock Converse image blocks (<code class="cite">agent/bedrock_adapter.py:544</code>), Codex Responses <code>input_image</code> items — including inside <code>function_call_output</code> (<code class="cite">agent/codex_responses_adapter.py:960</code>). For models that can't take images at all, <code>_prepare_messages_for_non_vision_model</code> swaps image parts for cached <code>vision_analyze</code> descriptions (<code class="cite">run_agent.py:7249</code>), multimodal tool results downgrade to their <code>text_summary</code> (<code class="cite">run_agent.py:7281</code>), and on a provider size rejection the loop re-encodes in-flight images below 4&nbsp;MB and retries (<code class="cite">agent/conversation_compression.py:4078</code>).</p>
+<p><strong>Producers.</strong> Beyond channel photos (Telegram/Discord/WhatsApp/Slack/Matrix/Signal/WeChat/QQ… download into the image cache; Telegram even runs sticker vision, <code class="cite">plugins/platforms/telegram/adapter.py:10137</code>), image parts come from <code>browser_vision</code> screenshots (<code class="cite">tools/browser_tool.py:2260</code>), computer-use screen captures with their own aux-vision routing gate (<code class="cite">tools/computer_use/vision_routing.py:164</code>), MCP image content blocks (<code class="cite">tools/mcp_tool.py:1864</code>), ACP resource links (<code class="cite">acp_adapter/server.py:494</code>), the OpenAI-compatible inbound API (<code class="cite">gateway/platforms/api_server.py:551</code>), and the dashboard's image-upload endpoint (<code class="cite">hermes_cli/web_server.py:2505</code>). In gateway text mode, <code>_enrich_message_with_vision</code> prepends a 2–4-sentence description per image (<code class="cite">gateway/run.py:24296</code>).</p>
+</section>
+
+<section id="text2audio">
+<h2>Text → Audio: <code>text_to_speech</code> and streaming TTS</h2>
+<p>The <code>text_to_speech</code> tool (params <code>text</code>, <code>output_path</code>, <code>speed</code>, <code>instructions</code>, <code>provider</code> — <code class="cite">tools/tts_tool.py:4451</code>, entry <code class="cite">tools/tts_tool.py:3487</code>) dispatches across <code>BUILTIN_TTS_PROVIDERS</code> (<code class="cite">tools/tts_tool.py:771</code>) with documented precedence <em>built-in &gt; command-type &gt; plugin</em> (<code class="cite">agent/tts_provider.py:12</code>). The default costs nothing: Microsoft <strong>edge-tts</strong> with voice <code>en-US-AriaNeural</code>.</p>
+<table class="grid">
+<thead><tr><th>Provider</th><th>Function</th><th>Default model / voice</th></tr></thead>
+<tbody>
+<tr><td><strong>edge</strong> (default)</td><td><code class="cite">tools/tts_tool.py:108</code></td><td><code>en-US-AriaNeural</code>, free, no key</td></tr>
+<tr><td>elevenlabs</td><td><code class="cite">tools/tts_tool.py:1748</code></td><td><code>eleven_multilingual_v2</code>, voice Adam; streaming uses <code>eleven_flash_v2_5</code></td></tr>
+<tr><td>openai</td><td><code class="cite">tools/tts_tool.py:1806</code></td><td><code>audio.speech</code> with <code>gpt-4o-mini-tts</code>, voice <code>alloy</code></td></tr>
+<tr><td>xai</td><td><code class="cite">tools/tts_tool.py:2091</code></td><td>voice <code>eve</code>, 24&nbsp;kHz; auto speech-tag injection</td></tr>
+<tr><td>minimax</td><td><code class="cite">tools/tts_tool.py:2218</code></td><td><code>speech-02-hd</code> via <code>/v1/t2a_v2</code> (intl + CN endpoints)</td></tr>
+<tr><td>mistral</td><td><code class="cite">tools/tts_tool.py:2356</code></td><td><code>voxtral-mini-tts-2603</code></td></tr>
+<tr><td>gemini</td><td><code class="cite">tools/tts_tool.py:2599</code></td><td><code>gemini-2.5-flash-preview-tts</code>, PCM wrapped to WAV; optional LLM audio-tag rewrite</td></tr>
+<tr><td>deepinfra</td><td><code class="cite">tools/tts_tool.py:1931</code></td><td>models discovered live via the <code>tts</code> tag</td></tr>
+<tr><td>piper / kittentts / neutts (local)</td><td><code class="cite">tools/tts_tool.py:2967</code>, <code class="cite">tools/tts_tool.py:3075</code>, <code class="cite">tools/tts_tool.py:2804</code></td><td>fully offline synthesis: <code>en_US-lessac-medium</code>, KittenML nano, NeuTTS-Air GGUF</td></tr>
+<tr><td>command-type</td><td><code class="cite">tools/tts_tool.py:1179</code></td><td>any shell template under <code>tts.providers.&lt;name&gt;: type: command</code></td></tr>
+</tbody>
+</table>
+<p><strong>Streaming.</strong> A parallel stack turns LLM <em>text deltas</em> into PCM while the reply is still generating: <code>StreamingTTSProvider</code> implementations for ElevenLabs/OpenAI/Gemini/xAI chunk text at sentence boundaries and emit int16 mono PCM (<code class="cite">tools/tts_streaming.py:131</code>), the gateway's <code>StreamingTTSConsumer</code> bridges the synchronous agent thread into an asyncio drain (<code class="cite">gateway/streaming_tts_consumer.py:55</code>), and adapters opt in via a five-method contract (<code>supports_streaming_tts</code> … <code>abort_streaming_tts</code>, <code class="cite">gateway/platforms/base.py:4557</code>) — with a barge-in latch so user speech interrupts playback.</p>
+<p><strong>Voice replies on channels.</strong> <code>/voice</code> toggles per-chat auto-TTS (<code class="cite">gateway/slash_commands.py:3244</code>, persisted state <code class="cite">gateway/run.py:7245</code>). When <code>_should_send_voice_reply</code> agrees (<code class="cite">gateway/run.py:21779</code>), <code>_send_voice_reply</code> synthesizes and hands the file to <code>adapter.send_voice()</code> (<code class="cite">gateway/run.py:21859</code>) — as Ogg/Opus on Telegram/WhatsApp/Signal/Matrix/Feishu (the platforms that render true voice bubbles, <code class="cite">tools/tts_tool.py:796</code>; ffmpeg conversion <code class="cite">tools/tts_tool.py:1403</code>), e.g. Telegram's <code>sendVoice</code> with a duration probe (<code class="cite">plugins/platforms/telegram/adapter.py:7547</code>). Discord goes further with live voice-channel playback through a 48&nbsp;kHz mixer with an ambient "thinking" bed and ducking (<code class="cite">plugins/platforms/discord/voice_mixer.py:1</code>). The dashboard/desktop exposes <code>POST /api/audio/speak</code> and a websocket PCM stream (<code class="cite">hermes_cli/web_server.py:5181</code>).</p>
+</section>
+
+<section id="audio2text">
+<h2>Audio → Text: transcription as a harness capability</h2>
+<p>STT lives in <code>tools/transcription_tools.py</code> but is <strong>never registered as a model tool</strong>. The public API is <code>transcribe_audio(file_path, model, source)</code> (<code class="cite">tools/transcription_tools.py:3153</code>) plus <code>transcribe_audio_local_fallback</code> — recover with local whisper when the configured cloud provider fails (<code class="cite">tools/transcription_tools.py:3226</code>). The dispatcher walks built-in → command-type → plugin (<code class="cite">tools/transcription_tools.py:2987</code>). The default provider is <strong>local</strong>: faster-whisper with the <code>base</code> model, Silero VAD, confidence gating on <code>no_speech_prob</code>/<code>logprob</code>, and idle model unload (<code class="cite">tools/transcription_tools.py:1897</code>).</p>
+<table class="grid">
+<thead><tr><th>Provider</th><th>Function</th><th>Models / endpoint</th></tr></thead>
+<tbody>
+<tr><td><strong>local</strong> (default)</td><td><code class="cite">tools/transcription_tools.py:1897</code></td><td>faster-whisper tiny…large-v3/turbo</td></tr>
+<tr><td>local_command</td><td><code class="cite">tools/transcription_tools.py:2049</code></td><td>any whisper CLI (incl. whisper.cpp) via <code>HERMES_LOCAL_STT_COMMAND</code></td></tr>
+<tr><td>groq</td><td><code class="cite">tools/transcription_tools.py:2147</code></td><td><code>whisper-large-v3-turbo</code> (default), large-v3, distil-en</td></tr>
+<tr><td>openai</td><td><code class="cite">tools/transcription_tools.py:2223</code></td><td><code>audio.transcriptions</code>: <code>whisper-1</code>, <code>gpt-4o-(mini-)transcribe</code></td></tr>
+<tr><td>mistral</td><td><code class="cite">tools/transcription_tools.py:2344</code></td><td><code>voxtral-mini-latest</code></td></tr>
+<tr><td>xai</td><td><code class="cite">tools/transcription_tools.py:2404</code></td><td><code>api.x.ai/v1/stt</code> — diarization, word timestamps</td></tr>
+<tr><td>elevenlabs</td><td><code class="cite">tools/transcription_tools.py:2574</code></td><td><code>scribe_v2</code>, diarize + audio-event tags</td></tr>
+<tr><td>deepinfra</td><td><code class="cite">tools/transcription_tools.py:2676</code></td><td>live <code>stt</code>-tagged catalog</td></tr>
+<tr><td>command / plugin</td><td><code class="cite">tools/transcription_tools.py:873</code>, ABC <code class="cite">agent/transcription_provider.py:61</code></td><td>shell templates; <code>register_transcription_provider</code> hook (<code class="cite">hermes_cli/plugins.py:2708</code>)</td></tr>
+</tbody>
+</table>
+<p><strong>Preprocessing</strong> handles the messy formats messaging platforms actually send: WeChat/QQ <code>.silk</code> voice codec → WAV via pilk (<code class="cite">tools/transcription_tools.py:1531</code>), iOS <code>.caf</code> → WAV, generic ffmpeg transcode, a 25&nbsp;MB cap, and an ffmpeg <code>silenceremove</code> trim before paying for cloud STT (<code class="cite">tools/transcription_tools.py:2820</code>).</p>
+<p><strong>The gateway voice-note pipeline.</strong> Only genuine voice messages qualify (<code>MessageType.VOICE</code> or <code>audio/*</code> voice notes — <code class="cite">gateway/run.py:2990</code>); <code>_enrich_message_with_transcription</code> transcribes in a worker thread, falls back to local whisper, and injects the transcript as a quoted line, optionally echoing <code>🎙️ "…"</code> back to the chat (<code class="cite">gateway/run.py:24367</code>; gates <code>stt.enabled</code> / <code>stt.echo_transcripts</code>, <code class="cite">gateway/config.py:959</code>). Audio <em>file attachments</em> are deliberately excluded: the model gets the cached path plus an instruction to "transcribe or process it yourself" via its own tools (<code class="cite">gateway/run.py:18042</code>).</p>
+<p><strong>Live voice.</strong> The same <code>transcribe_audio</code> core powers Discord voice-channel listening (<code class="cite">plugins/platforms/discord/adapter.py:4929</code>), CLI voice mode with a whisper-hallucination filter (<code class="cite">tools/voice_mode.py:1249</code>), TUI continuous VAD capture (<code class="cite">hermes_cli/voice.py:432</code>), wake-word activation ("hey Hermes" via openWakeWord, <code class="cite">tools/wake_word.py:847</code>), and the dashboard's <code>POST /api/audio/transcribe</code> (<code class="cite">hermes_cli/web_server.py:4974</code>).</p>
+</section>
+
+<section id="mediaplane">
+<h2>The shared media plane</h2>
+<ul>
+<li><strong>Inbound caching with content sniffing</strong> — <code>cache_image_from_bytes/url</code> verify magic bytes so an HTML error page can't be cached as a <code>.jpg</code> (<code class="cite">gateway/platforms/base.py:837</code>); audio extensions are corrected by a real container sniffer that distinguishes M4A vs MP4 <code>ftyp</code> brands and MP3 vs ADTS sync words (<code class="cite">tools/audio_container.py:1</code>). Size guards cap inbound media before download completes (<code class="cite">gateway/platforms/base.py:758</code>).</li>
+<li><strong>Outbound delivery with path safety</strong> — the model attaches files via <code>MEDIA:&lt;path&gt;</code> tags; <code>validate_media_delivery_path</code> enforces allowed roots, recency, and deny-lists before anything leaves the machine (<code class="cite">gateway/platforms/base.py:1684</code>), with per-platform how-to-attach guidance injected into the system prompt (<code class="cite">agent/prompt_builder.py:817</code>).</li>
+<li><strong>The multimodal tool-result envelope</strong> — any tool can return <code>{"_multimodal": true, "content": […], "text_summary": …}</code>; the registry enforces the shape (<code class="cite">tools/registry.py:1084</code>) and every consumer (display, logging, compression, non-vision models) knows to fall back to <code>text_summary</code> (<code class="cite">agent/tool_dispatch_helpers.py:349</code>).</li>
+<li><strong>ffmpeg as the universal shim</strong> — one discovery helper (<code class="cite">tools/transcription_tools.py:231</code>) serves STT transcodes, silence trimming, TTS→Opus conversion for voice bubbles, and Discord playback.</li>
+<li><strong>Relay media plane</strong> — for the experimental Relay connector, generated images and voice notes upload to <code>/relay/media</code> and connector attachments download to local temp files so vision/file tools always see a local path (<code class="cite">gateway/relay/media.py:71</code>).</li>
+</ul>
+</section>
+
+<section id="gaps">
+<h2>What is explicitly <em>not</em> in core</h2>
+<ul>
+<li><strong>OCR.</strong> No tesseract/easyocr/paddleocr anywhere. Scanned-PDF handling is <em>prompt-driven</em>: <code>read_file</code>'s extraction-coverage warning literally instructs the model to run <code>pdftoppm -jpeg -r 150 …</code> and inspect each page with <code>vision_analyze</code> (<code class="cite">tools/read_extract.py:297</code>, <code class="cite">tools/file_tools.py:2654</code>). Dedicated OCR lives in the optional <code>skills/productivity/ocr-and-documents</code> skill (marker-pdf).</li>
+<li><strong>No Replicate/Stability/Together image backends</strong> — only a forward-looking comment (<code class="cite">hermes_cli/tools_config.py:3947</code>). No Deepgram or gTTS either; those names appear only as examples in the provider-ABC docstrings.</li>
+<li><strong>No in-tree TTS or STT plugins.</strong> Both ABCs and registries are wired end-to-end, but <code>plugins/tts/</code> and <code>plugins/transcription/</code> don't exist — the extension points are documented and empty (<code class="cite">agent/tts_provider.py:32</code>).</li>
+<li><strong>No music/audio generation in core</strong> — only optional skills (audiocraft MusicGen/AudioGen; Suno prompting).</li>
+<li><strong>SMS/Twilio has no media path at all</strong> — no MMS in or out; likewise a2a, ntfy, irc and other minimal adapters.</li>
+</ul>
+</section>
+
+<section id="config">
+<h2>Config &amp; env quick reference</h2>
+<table class="grid">
+<thead><tr><th>Capability</th><th>Config keys</th><th>Common env</th></tr></thead>
+<tbody>
+<tr><td>Text→Image</td><td><code>image_gen.provider</code>, <code>image_gen.&lt;name&gt;.model</code></td><td><code>FAL_KEY</code>, <code>OPENAI_API_KEY</code>, <code>XAI_API_KEY</code>, <code>OPENROUTER_API_KEY</code>, <code>DEEPINFRA_API_KEY</code>, <code>KREA_API_KEY</code></td></tr>
+<tr><td>Image→Text</td><td><code>agent.image_input_mode</code> (auto/native/text), <code>auxiliary.vision.{provider,model,…}</code> (<code class="cite">hermes_cli/config_defaults.py:980</code>)</td><td><code>AUXILIARY_VISION_MODEL</code> (legacy), <code>VISION_TOOLS_DEBUG</code></td></tr>
+<tr><td>Text→Audio</td><td><code>tts.provider</code>, <code>tts.&lt;name&gt;.*</code>, <code>tts.&lt;name&gt;.streaming</code>, <code>voice.auto_tts</code> (defaults <code class="cite">hermes_cli/config_defaults.py:1571</code>)</td><td><code>ELEVENLABS_API_KEY</code>, <code>VOICE_TOOLS_OPENAI_KEY</code>, <code>MINIMAX_API_KEY</code>, <code>MISTRAL_API_KEY</code>, <code>GEMINI_API_KEY</code></td></tr>
+<tr><td>Audio→Text</td><td><code>stt.provider</code>, <code>stt.enabled</code>, <code>stt.echo_transcripts</code>, <code>stt.cloud_trim_silence</code>, <code>wake_word.*</code></td><td><code>GROQ_API_KEY</code>, <code>STT_OPENAI_MODEL</code>, <code>STT_GROQ_MODEL</code>, <code>HERMES_LOCAL_STT_COMMAND</code> (<code class="cite">.env.example:433</code>)</td></tr>
+</tbody>
+</table>
+<p>Optional dependency groups: <code>edge-tts</code> ships in the base install (<code class="cite">pyproject.toml:179</code>); <code>tts-premium</code> adds ElevenLabs; <code>voice</code> adds faster-whisper + sounddevice (<code class="cite">pyproject.toml:198</code>); <code>wake</code> adds openWakeWord. Pillow is a core dependency (<code class="cite">pyproject.toml:134</code>) — image handling never needs an extra. Heavy per-provider SDKs load lazily on first use (<code class="cite">tools/lazy_deps.py:140</code>). The interactive picker for all of this is <code>hermes tools</code> (<code class="cite">hermes_cli/tools_config.py:524</code>).</p>
+</section>
+    </main>
+  </div>
+  <footer>
+    Hermes Agent fresh wiki · grounded 2026-08-19 against commit <code>42a4c91c4</code>
+    for <code>IgorTavcar/hermes-agent</code> (fork of <code>NousResearch/hermes-agent</code>);
+    citations are <code>path:line</code> into the working tree; diagrams render offline via vendored mermaid.
+  </footer>
+  <script>
+    const links = [...document.querySelectorAll('.sidebar a')];
+    const map = new Map(links.map(a => [a.getAttribute('href').slice(1), a]));
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          links.forEach(a => a.classList.remove('active'));
+          const a = map.get(e.target.id);
+          if (a) a.classList.add('active');
+        }
+      });
+    }, { rootMargin: '-80px 0px -70% 0px' });
+    document.querySelectorAll('main section[id]').forEach(s => obs.observe(s));
+  </script>
+</body>
+</html>
