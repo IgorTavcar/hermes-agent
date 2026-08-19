@@ -19,6 +19,7 @@ PAGES = [
     ("providers.html", "Providers & Tiers"),
     ("channels.html", "Channels"),
     ("multimodal.html", "Multimodal I/O"),
+    ("orchestration.html", "Orchestration"),
     ("skills.html", "Self-Adaptive Skills"),
     ("transfer.html", "Transferables"),
 ]

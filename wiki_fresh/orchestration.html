@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Orchestration &amp; Subagents · Hermes Fresh Wiki</title>
+  <link rel="stylesheet" href="./style.css">
+  <script defer src="./search-index.js"></script>
+  <script defer src="./wiki.js"></script>
+  <script src="./vendor/mermaid.min.js"></script>
+  <script>
+    window.addEventListener("DOMContentLoaded", function () {
+      if (!window.mermaid) return;
+      try {
+        mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "loose",
+          themeVariables: { fontFamily: "ui-monospace, monospace", fontSize: "13px",
+            primaryColor: "#171b24", primaryBorderColor: "#2d3543", primaryTextColor: "#e7ebf2",
+            lineColor: "#c9a93a", secondaryColor: "#12151c", tertiaryColor: "#0a0c10" } });
+        mermaid.run({ querySelector: "pre.mermaid" });
+      } catch (e) { console.error("mermaid render failed", e); }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="index.html"><span class="mark">☤</span> Hermes Agent <span class="sub">Fresh Wiki</span></a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="loops.html">Turn Loops</a>
+      <a href="kernels.html">LLM Kernels</a>
+      <a href="providers.html">Providers &amp; Tiers</a>
+      <a href="channels.html">Channels</a>
+      <a href="multimodal.html">Multimodal I/O</a>
+      <a href="orchestration.html" class="active">Orchestration</a>
+      <a href="skills.html">Self-Adaptive Skills</a>
+      <a href="transfer.html">Transferables</a>
+    </nav>
+  </header>
+  <div class="layout">
+    <aside class="sidebar">
+      <p class="toc-title">On this page</p>
+      <ul>
+        <li><a href="#tiers">Three agent tiers</a></li>
+        <li><a href="#workflows">Workflow support map</a></li>
+        <li><a href="#kanban">The Kanban DAG engine</a></li>
+        <li><a href="#dynamic">Dynamic workflows?</a></li>
+        <li><a href="#delegate">delegate_task anatomy</a></li>
+        <li><a href="#steer">Steerability</a></li>
+        <li><a href="#isolation">Context isolation</a></li>
+        <li><a href="#config">Configurability &amp; budgets</a></li>
+        <li><a href="#observe">Observability</a></li>
+        <li><a href="#comms">Inter-agent communication</a></li>
+        <li><a href="#background">Harness self-agents</a></li>
+        <li><a href="#absences">Consolidated absences</a></li>
+      </ul>
+    </aside>
+    <main>
+<div class="hero">
+<h1 class="page-title">Orchestration &amp; Subagents</h1>
+<p class="lead">How Hermes runs many agents: the one model-facing spawn tool (<code>delegate_task</code>), the OS-process worker fleet behind the Kanban board, agent-to-agent protocols, and the harness's own background forks — measured along five axes: steerability, context isolation, configurability, observability, and inter-agent communication. The headline finding: Hermes has <strong>no dynamic workflow engine</strong> — the model never writes orchestration <em>code</em>; it declares intent (a task, a batch, a dependency graph) and a validated kernel executes it.</p>
+</div>
+
+<section id="tiers">
+<h2>Three agent tiers, one design stance</h2>
+<pre class="mermaid">graph TD;
+  U[user turn] --> P[parent AIAgent];
+  P -->|delegate_task batch| C[child threads: fresh context];
+  P -.->|steer / stop| C;
+  C -->|summary + output_schema| Q[completion queue -> new turn];
+  T[gateway dispatcher tick] -->|DAG node ready| W[kanban worker: own OS process];
+  W -->|complete / comment| B[(board SQLite)];
+  B --> T;
+  P -->|a2a_call / a2a_orchestrate| R[remote Hermes peer];
+  F[turn finalizer] -->|fork| BR[background review: shared session, persist disabled];</pre>
+<table class="grid">
+<thead><tr><th>Tier</th><th>Members</th><th>Isolation</th><th>Kill semantics</th></tr></thead>
+<tbody>
+<tr><td><strong>In-process threads</strong></td><td><code>delegate_task</code> children, plugin-launched subagents, background review, curator</td><td>fresh conversation, own SQLite session; shares process, container, working copy</td><td>cooperative interrupt flag only</td></tr>
+<tr><td><strong>OS processes</strong></td><td>Kanban workers (<code>hermes -p &lt;profile&gt; chat -q "work kanban task &lt;id&gt;"</code>, <code class="cite">hermes_cli/kanban_db.py:10900</code>), A2A profile forwarding</td><td>own process, profile, workdir</td><td>real SIGTERM→SIGKILL on runtime cap (<code class="cite">hermes_cli/kanban_db.py:4971</code>)</td></tr>
+<tr><td><strong>Network peers</strong></td><td>A2A JSON-RPC between Hermes instances (<code class="cite">plugins/platforms/a2a/adapter.py:338</code>)</td><td>separate machines/accounts</td><td>request timeout + ping-pong caps</td></tr>
+</tbody>
+</table>
+<div class="callout key"><strong>The stance.</strong> Everywhere the model participates in orchestration it emits <em>data</em> — a goal, a task list, a <code>{tasks, parents}</code> graph — and a kernel validates and executes it. Control flow (loops, conditionals, retries, scheduling) always lives in harness code. This trades expressiveness for governability: spawns can be paused globally (<code class="cite">tools/delegate_tool.py:194</code>), capped per turn, and halted by an ESTOP that by policy never kills in-flight work (<code class="cite">agent/estop.py:12</code>).</div>
+</section>
+
+<section id="workflows">
+<h2>Workflow support map</h2>
+<table class="grid">
+<thead><tr><th>Mechanism</th><th>Nature</th><th>Where</th></tr></thead>
+<tbody>
+<tr><td><strong>Kanban DAG</strong> <span class="badge yes">engine</span></td><td>persistent dependency graph; nodes are full agent processes</td><td><a href="#kanban">below</a></td></tr>
+<tr><td><strong>Batch delegation</strong> <span class="badge yes">core tool</span></td><td>flat parallel fan-out, one consolidated result</td><td><a href="#delegate"><code>delegate_task</code></a></td></tr>
+<tr><td><strong>Swarm topology</strong> <span class="badge partial">scripted shape</span></td><td>root → N workers → verifier → synthesizer, written <em>into</em> Kanban ("this module intentionally does not introduce a second scheduler")</td><td><code class="cite">hermes_cli/kanban_swarm.py:128</code>, CLI-only (<code class="cite">hermes_cli/kanban.py:405</code>)</td></tr>
+<tr><td><strong>Cron chaining</strong> <span class="badge partial">weak handoff</span></td><td><code>context_from</code> prefixes job B's prompt with job A's <em>latest output file</em> (8&nbsp;KB cap) — explicitly "does not wait for upstream jobs" (<code class="cite">tools/cronjob_tools.py:1710</code>); plus <code>monitor_script</code> diff-gating and a per-job notepad KV that is deliberately not a model tool (<code class="cite">cron/notepad.py:17</code>)</td><td><code class="cite">cron/scheduler.py:3828</code>; jobs run full <code>AIAgent</code> turns (<code class="cite">cron/scheduler.py:4585</code>)</td></tr>
+<tr><td><strong>teams_pipeline</strong> <span class="badge partial">hard-coded</span></td><td>linear state machine (transcript → STT → one aux-LLM call → Notion/Linear/Teams sinks); dataclasses between stages, no agent turns</td><td><code class="cite">plugins/teams_pipeline/pipeline.py:43</code>, <code class="cite">plugins/teams_pipeline/pipeline.py:332</code></td></tr>
+<tr><td><strong>/loop &amp; /goal</strong> <span class="badge partial">iteration only</span></td><td>re-run a prompt on cadence with digest self-pacing; "Ralph loop" with an aux judge deciding goal completion</td><td><code class="cite">hermes_cli/loops.py:528</code>, <code class="cite">hermes_cli/goals.py:1</code></td></tr>
+<tr><td><strong>Hooks</strong> <span class="badge partial">deterministic wiring</span></td><td>~40 plugin events + shell hooks + gateway hooks; a few decision-capable: <code>pre_tool_call</code> blocks, <code>pre_verify</code> forces the turn to continue, <code>command:&lt;name&gt;</code> can deny/rewrite (<code class="cite">gateway/run.py:17093</code>)</td><td><code class="cite">hermes_cli/plugins.py:156</code>, <code class="cite">agent/shell_hooks.py:247</code>, <code class="cite">gateway/hooks.py:54</code></td></tr>
+<tr><td><strong>Batch/eval runners</strong> <span class="badge partial">offline</span></td><td>dataset → agent → trajectory JSONL over <code>multiprocessing.Pool</code> (<code class="cite">batch_runner.py:920</code>); <code>mini_swe_runner</code> is strictly sequential (<code class="cite">mini_swe_runner.py:594</code>)</td><td>eval tooling, not shipped harness paths</td></tr>
+<tr><td>Declarative workflow format</td><td><span class="badge no">absent</span> — no step/stage/DAG definition language anywhere; cron "blueprints" compile a SKILL.md schedule into a single job "so there is no second job engine" (<code class="cite">tools/blueprints.py:95</code>, <code class="cite">cron/blueprint_catalog.py:14</code>)</td><td>—</td></tr>
+</tbody>
+</table>
+<p>Notable hook detail: the gateway's live-turn intercepts (<code>/stop</code>, <code>/approve</code>) deliberately fire <em>no</em> hooks, so a slow or hostile plugin can never take away the operator's escape hatches (<code class="cite">hermes_cli/plugins.py:375</code>).</p>
+</section>
+
+<section id="kanban">
+<h2>The Kanban DAG: the real workflow engine</h2>
+<p>The closest thing to a workflow engine is a task board. It is a genuine dependency-graph executor: <code>link_tasks</code> creates edges with cycle rejection (<code class="cite">hermes_cli/kanban_db.py:3829</code>, <code class="cite">hermes_cli/kanban_db.py:3860</code>); a child promotes to ready only when <em>every</em> parent is done (<code>_parents_satisfied</code>, <code class="cite">hermes_cli/kanban_db.py:4606</code>, inside <code>recompute_ready</code> <code class="cite">hermes_cli/kanban_db.py:4510</code>); block kinds are typed — <code>dependency</code> blocks auto-promote rather than entering the human "blocked" bucket (<code class="cite">hermes_cli/kanban_db.py:125</code>).</p>
+<p>Execution: a gateway watcher ticks <code>dispatch_once</code> every 60&nbsp;s under a machine-global lockfile (<code class="cite">gateway/kanban_watchers.py:1182</code>, <code class="cite">hermes_cli/kanban_db.py:9808</code>); each ready node spawns a <strong>full agent OS process</strong> via <code>subprocess.Popen</code> pinned to a profile — which carries model, provider, reasoning effort, toolsets and system prompt per node (<code class="cite">hermes_cli/kanban_db.py:10709</code>). Workers are supervised for real: PID-based crash detection, stale-claim reclaim, SIGTERM→SIGKILL on <code>max_runtime_seconds</code> (<code class="cite">hermes_cli/kanban_db.py:4971</code>), and a memory-derived concurrency default of 512&nbsp;MiB per worker clamped to 2–8 (<code class="cite">hermes_cli/kanban_db.py:9664</code>).</p>
+<p><strong>What it cannot do</strong>: no conditional branching, no loops, no typed data between nodes. Handoff is prose — completion summaries and comments, which the tool descriptions call "the deliberate handoff channel between tasks" (<code class="cite">tools/kanban_tools.py:1101</code>) — plus the swarm "blackboard", structured JSON comments on the root task (<code class="cite">hermes_cli/kanban_swarm.py:337</code>).</p>
+</section>
+
+<section id="dynamic">
+<h2>Dynamic workflows — the direct answer</h2>
+<p><strong>There is no Workflow-script facility.</strong> Nothing lets the model author and execute an orchestration program in the Claude-Code sense (a script composing <code>agent()</code> / <code>pipeline()</code> / <code>parallel()</code>). Two hard boundaries enforce this:</p>
+<ul>
+<li>The <code>execute_code</code> sandbox RPC — the obvious place to hang model-written orchestration — is hard-gated to exactly seven data tools: <code>SANDBOX_ALLOWED_TOOLS = {web_search, web_extract, read_file, write_file, search_files, patch, terminal}</code> (<code class="cite">tools/code_execution_tool.py:63</code>), 50 calls per execution (<code class="cite">tools/code_execution_tool.py:75</code>), dispatched through the same guarded handler the LLM uses (<code class="cite">tools/code_execution_tool.py:652</code>). No <code>delegate_task</code>, no <code>cronjob</code>, no kanban, no MCP behind the RPC. The only leak is <code>terminal</code> — a script <em>could</em> shell out to <code>hermes chat -q</code>, but that routes through the normal approval stack with no result plumbing: shelling out, not orchestration.</li>
+<li>No graph structure accepts control flow: Kanban edges are pure "wait for all parents".</li>
+</ul>
+<p>What exists instead is <strong>declarative graph emission</strong>. <code>kanban_decompose</code> prompts an auxiliary LLM for <code>{"tasks": [{title, body, assignee, parents: [indices]}]}</code> with the execution semantics spelled out in the prompt — parents are data dependencies, parentless tasks run in parallel (<code class="cite">hermes_cli/kanban_decompose.py:52</code>). The kernel then validates with a Kahn's-algorithm cycle check over the whole sibling graph and writes the entire decomposition in one atomic transaction (<code class="cite">hermes_cli/kanban_db.py:7339</code>). It runs automatically each dispatcher tick, gated by <code>kanban.auto_decompose</code> re-read every tick so flipping the flag halts runaway fan-out without a restart (<code class="cite">gateway/kanban_watchers.py:1600</code>). A running orchestrator agent can also build graphs itself — <code>kanban_create</code>'s description says outright: "used by orchestrator workers to fan out — decompose work into child tasks, link them into a pipeline, then complete your own task" (<code class="cite">tools/kanban_tools.py:2137</code>).</p>
+<div class="callout surprise"><strong>Model emits data, kernel executes.</strong> Claude Code hands the model a Turing-complete orchestration script; Hermes hands it a JSON graph a scheduler executes. Less expressive — no conditionals, no loops, no map-reduce composition — but trivially validatable, pausable, rate-limitable, and resumable, because the "workflow state" is rows in SQLite rather than a running program.</div>
+</section>
+
+<section id="delegate">
+<h2><code>delegate_task</code> anatomy</h2>
+<p>The one model-facing spawn tool (schema <code class="cite">tools/delegate_tool.py:4730</code>, registered <code class="cite">tools/delegate_tool.py:4906</code>, toolset <code>delegation</code> <code class="cite">toolsets.py:299</code>, entry <code class="cite">tools/delegate_tool.py:3597</code>). Params: <code>goal</code>, <code>context</code>, <code>tasks[]</code> for batch fan-out, <code>role</code> (<code>leaf|orchestrator</code>), per-task <code>output_schema</code>, and the control plane <code>action=list|steer|stop</code>. Two params are accepted and <em>ignored</em>: <code>background</code> is deprecated (<code class="cite">tools/delegate_tool.py:4816</code>) — the harness decides sync-vs-background itself, forcing <code>background=(not _is_subagent)</code> so top-level delegations never block the chat and orchestrator children stay synchronous to synthesize (<code class="cite">run_agent.py:8242</code>) — and a model-supplied <code>max_iterations</code> is discarded in favor of config (<code class="cite">tools/delegate_tool.py:3689</code>).</p>
+<p>Background results return as a <strong>new turn</strong>: a completion event on the shared <code>process_registry.completion_queue</code> (<code class="cite">tools/async_delegation.py:1220</code>), injected by the gateway's delegation watcher (<code class="cite">gateway/run.py:25485</code>), backed by a durable <code>async_delegations</code> ledger with crash recovery and delivery retry — 48&nbsp;h replay, 8 attempts (<code class="cite">tools/async_delegation.py:142</code>, <code class="cite">tools/async_delegation.py:335</code>). Guardrails: 50 spawns per turn (<code class="cite">agent/tool_guardrails.py:483</code>, <code class="cite">hermes_cli/config_defaults.py:656</code>), and multiple <code>delegate_task</code> calls in one assistant message are truncated to the concurrency cap (<code class="cite">run_agent.py:4883</code>).</p>
+<p>Plugins get the same machinery through <code>SubagentLifecycleService</code> — contract objects and HMAC handles instead of raw agents, on its own hardcoded 8-worker executor (<code class="cite">agent/subagent_lifecycle.py:187</code>, <code class="cite">agent/subagent_lifecycle.py:165</code>).</p>
+</section>
+
+<section id="steer">
+<h2>Steerability: main loop vs children vs workers</h2>
+<p>One delivery primitive serves everything: <code>AIAgent.steer()</code> (<code class="cite">run_agent.py:3381</code>) stashes text that is <em>appended into the last tool-result message</em> at the next iteration boundary (<code class="cite">agent/agent_runtime_helpers.py:4223</code>) — never inserting a message, so role alternation and the prompt cache survive.</p>
+<table class="grid">
+<thead><tr><th></th><th>Main loop</th><th>delegate_task child</th><th>Kanban worker</th></tr></thead>
+<tbody>
+<tr><td>steer</td><td><span class="badge yes">yes</span> <code>busy_input_mode: steer</code> (<code class="cite">hermes_cli/config_defaults.py:1213</code>, gateway path <code class="cite">gateway/run.py:10136</code>)</td><td><span class="badge yes">yes</span> model: <code>action="steer"</code> (<code class="cite">tools/delegate_tool.py:290</code>); RPC <code>subagent.steer</code> fails closed outside gateway/TUI hosts (<code class="cite">tui_gateway/methods_session.py:3242</code>)</td><td><span class="badge no">no</span> — board comments only, before it starts</td></tr>
+<tr><td>redirect (cancel in-flight call + correct)</td><td><span class="badge yes">yes</span> <code>AIAgent.redirect</code> (<code class="cite">run_agent.py:3417</code>)</td><td><span class="badge no">no</span> — <code>_CONTROL_ACTIONS = {list, steer, stop}</code> (<code class="cite">tools/delegate_tool.py:403</code>)</td><td><span class="badge no">no</span></td></tr>
+<tr><td>cancel</td><td><span class="badge yes">yes</span> interrupt / queue / <code>/stop</code></td><td><span class="badge partial">cooperative</span> — flag recurses into grandchildren, "does not hard-kill the worker thread" (<code class="cite">tools/delegate_tool.py:266</code>); stall watchdog force-finalizes as <code>stalled</code> after 450&nbsp;s idle / 1200&nbsp;s in-tool (<code class="cite">tools/async_delegation.py:1249</code>)</td><td><span class="badge yes">hard kill</span> SIGTERM→SIGKILL (<code class="cite">hermes_cli/kanban_db.py:4971</code>)</td></tr>
+</tbody>
+</table>
+<ul>
+<li><strong>Steer races are first-class.</strong> Acceptance closes under the registry lock; a steer that misses the last delivery boundary is drained into the completion entry as <code>missed_steer</code> — reported, never silently dropped (<code class="cite">tools/delegate_tool.py:242</code>, <code class="cite">tools/delegate_tool.py:3151</code>).</li>
+<li><strong>Subagents shield the main loop.</strong> With live children, the gateway demotes <code>interrupt</code> mode to <code>queue</code> so a casual chat follow-up can't destroy hours of delegated work; <code>/stop</code> still forces it (<code class="cite">gateway/run.py:9744</code>, <code class="cite">gateway/run.py:10112</code>).</li>
+<li><strong>Kill switches by blast radius</strong>: per-child <code>stop</code>; per-session <code>interrupt_for_session</code> on <code>/new</code> (<code class="cite">tools/async_delegation.py:1531</code>); process-wide <code>interrupt_all</code> on shutdown (<code class="cite">tools/async_delegation.py:1502</code>); a global spawn-pause toggle from the TUI (<code class="cite">tools/delegate_tool.py:194</code>, RPC <code class="cite">tui_gateway/methods_session.py:3223</code>); and ESTOP, which pauses <em>new</em> cron/kanban/gateway work but never kills in-flight (<code class="cite">agent/estop.py:12</code>).</li>
+<li><strong>Gap:</strong> the TUI <code>/agents</code> overlay has kill and pause keys but no steer key — the <code>subagent.steer</code> RPC has no UI caller (<code class="cite">ui-tui/src/components/agentsOverlay.tsx:684</code>).</li>
+</ul>
+</section>
+
+<section id="isolation">
+<h2>Context isolation &amp; workspaces</h2>
+<p>Children are built by <code>_build_child_agent</code> (<code class="cite">tools/delegate_tool.py:1578</code>) with a <strong>fresh conversation, never the parent transcript</strong>: an ephemeral system prompt of goal + context only (<code class="cite">tools/delegate_tool.py:1173</code>), <code>skip_context_files</code>, <code>skip_memory</code>, no clarify callback. Toolsets are inherited and <em>intersected, never expanded</em> — "subagent must not gain tools the parent lacks" (<code class="cite">tools/delegate_tool.py:1660</code>) — and <code>DELEGATE_BLOCKED_TOOLS = {delegate_task, clarify, memory, send_message, cronjob}</code> strips recursion, user interaction, shared-memory writes, and outbound side effects (<code class="cite">tools/delegate_tool.py:50</code>, <code class="cite">tools/delegate_tool.py:1278</code>); <code>role="orchestrator"</code> re-adds only delegation, one level deep by default.</p>
+<ul>
+<li><strong>State</strong>: own SQLite session with its own DB handle on the parent's file and <code>parent_session_id</code> lineage (<code class="cite">tools/delegate_tool.py:1900</code>); child sessions are hidden from pickers/search (<code class="cite">tools/session_search_tool.py:46</code>) and cascade-delete with the parent (<code class="cite">hermes_state.py:301</code>).</li>
+<li><strong>Workspace</strong>: opt-in git-worktree isolation puts each child in <code>.worktrees/subagent-&lt;id&gt;</code> on its own branch, with <code>{commits, dirty, pruned}</code> reported in the result (<code class="cite">tools/subagent_worktree.py:120</code>, flag <code class="cite">tools/delegate_tool.py:887</code>) — local backend + git only, off by default. Otherwise children share the parent's working copy <em>and container</em> (<code class="cite">tools/delegate_tool.py:2704</code>).</li>
+<li><strong>The one deliberate leak</strong>: a "subagent modified files the parent previously read" reminder built from the file-write registry, appended to the summary (<code class="cite">tools/delegate_tool.py:3171</code>).</li>
+<li><strong>The opposite trade</strong>: the background-review fork deliberately <em>shares</em> the parent's session id and cached system prompt for warm prefix cache, with persistence hard-disabled so it cannot corrupt the session (<code class="cite">agent/background_review.py:1062</code>).</li>
+</ul>
+</section>
+
+<section id="config">
+<h2>Configurability &amp; budgets</h2>
+<p>All operator-side, under <code>delegation:</code> (<code class="cite">hermes_cli/config_defaults.py:1825</code>, documented <code class="cite">cli-config.yaml.example:1466</code>):</p>
+<table class="grid">
+<thead><tr><th>Key</th><th>Default</th><th>Reader</th></tr></thead>
+<tbody>
+<tr><td><code>model / provider / base_url / api_key</code></td><td>inherit parent</td><td><code class="cite">tools/delegate_tool.py:4417</code></td></tr>
+<tr><td><code>reasoning_effort</code></td><td>inherit</td><td>applied at child build</td></tr>
+<tr><td><code>max_iterations</code></td><td>250</td><td><code class="cite">tools/delegate_tool.py:1092</code></td></tr>
+<tr><td><code>max_concurrent_children</code></td><td>10</td><td><code class="cite">tools/delegate_tool.py:846</code></td></tr>
+<tr><td><code>max_spawn_depth</code></td><td>1 (flat)</td><td><code class="cite">tools/delegate_tool.py:973</code></td></tr>
+<tr><td><code>child_timeout_seconds</code></td><td>0 = none</td><td><code class="cite">tools/delegate_tool.py:931</code></td></tr>
+<tr><td><code>subagent_auto_approve</code></td><td>false → auto-<strong>deny</strong> dangerous commands</td><td><code class="cite">tools/delegate_tool.py:105</code></td></tr>
+<tr><td><code>worktree_isolation</code></td><td>false</td><td><code class="cite">tools/delegate_tool.py:887</code></td></tr>
+<tr><td><code>command</code> (pin children to an external ACP agent binary)</td><td>unset; must exist on PATH or the spawn fails loudly</td><td><code class="cite">tools/delegate_tool.py:1784</code></td></tr>
+</tbody>
+</table>
+<p>Kanban adds genuine per-<em>node</em> configuration: each task's assignee is a profile carrying model, provider, reasoning effort, toolsets and prompt (<code class="cite">hermes_cli/kanban_db.py:10709</code>).</p>
+<div class="callout warn"><strong>The big absences.</strong> The <em>model</em> can configure almost nothing per spawn — no model, no effort, no toolsets, no timeout (schema has no such params; <code>toolsets=None</code> is forced at <code class="cite">tools/delegate_tool.py:3847</code>). And there is <strong>no token/cost budget anywhere</strong>: per-child <code>cost_usd</code> is measured and rolled up, but never enforced — caps are iteration count, optional wall-clock, and concurrency only.</div>
+</section>
+
+<section id="observe">
+<h2>Observability</h2>
+<ul>
+<li><strong>Live transcripts as files</strong> — one append-only, redacted log per child under <code>cache/delegation/live/</code> (<code class="cite">tools/delegation_live_log.py:112</code>), whose path is handed back to the <em>parent model</em> with an explicit <code>tail -f</code> hint (<code class="cite">tools/delegate_tool.py:4304</code>) — the model can watch its own children with the terminal tool.</li>
+<li><strong>Structured progress events</strong> — <code>subagent.spawn_requested/start/tool/thinking/text/complete</code> carrying <code>subagent_id</code>, <code>parent_id</code>, <code>depth</code>, <code>model</code> (<code class="cite">tools/delegate_tool.py:1338</code>), rendered as the TUI <code>/agents</code> spawn tree and desktop panels.</li>
+<li><strong>Durable ledger</strong> — the <code>async_delegations</code> table with delivery claims and crash recovery means completions survive process restarts and land as a new turn (<code class="cite">tools/async_delegation.py:142</code>).</li>
+<li><strong>Cost attribution</strong> — per-child tokens/api_calls/duration/cost plus a tool trace in every result, rolled into the parent session's spend (<code class="cite">tools/delegate_tool.py:3403</code>).</li>
+<li><strong>Hooks</strong> — <code>subagent_start</code> / <code>subagent_stop</code> with a sanitized tool-call history (<code class="cite">tools/delegate_tool.py:2055</code>, <code class="cite">tools/delegate_tool.py:3454</code>).</li>
+<li><strong>Gap</strong> — the parent <em>model</em> is blind mid-run by design (context protection): no child events enter its context until the completion message, unless it polls <code>action="list"</code> or tails the live log itself.</li>
+</ul>
+</section>
+
+<section id="comms">
+<h2>Inter-agent communication</h2>
+<ul>
+<li><strong>Parent↔child</strong>: goal + context down; one summary up, optionally validated against a per-task JSON Schema with exactly one bounded correction retry (<code class="cite">tools/delegation_output_schema.py:1</code>, driven at <code class="cite">tools/delegate_tool.py:2925</code>) — the repo's only typed inter-agent contract. Mid-run: parent→child <code>steer</code> only; children cannot ask questions (<code>clarify</code> blocked).</li>
+<li><strong>Sibling↔sibling: absent by design.</strong> Ownership checks restrict control to one's own descendants; shared state is only the filesystem, the shared container, and (for kanban) the board.</li>
+<li><strong>LLM-free handoffs</strong>: kanban comments/blackboard, cron's <code>context_from</code> file injection, and <code>teams_pipeline</code>'s dataclasses between stages. Nothing routes child A's output directly into child B's input inside a delegation batch — that composition exists only via the Kanban DAG.</li>
+<li><strong>Cross-instance</strong>: the A2A plugin is a real agent-to-agent protocol — outbound <code>a2a_discover/call/orchestrate</code> with capability-based fan-out to peers in <code>all|first|best</code> modes (<code class="cite">plugins/platforms/a2a/tools.py:396</code>), an inbound JSON-RPC server with Agent Card (<code class="cite">plugins/platforms/a2a/adapter.py:338</code>), ping-pong loop protection (<code class="cite">plugins/platforms/a2a/protocol.py:454</code>), and Hermes→Hermes forwarding across local profiles by subprocess (<code class="cite">plugins/platforms/a2a/adapter.py:850</code>).</li>
+<li><strong>Adjacent</strong>: <code>send_message</code> targets chat platforms, not agent sessions, and is blocked for children (<code class="cite">tools/send_message_tool.py:208</code>); delivery mirroring writes a record into the target session's transcript — one-directional, text-only (<code class="cite">gateway/mirror.py:25</code>); ACP session forking deep-copies history into a new editor session (<code class="cite">acp_adapter/session.py:253</code>).</li>
+</ul>
+</section>
+
+<section id="background">
+<h2>Harness-spawned self-agents</h2>
+<table class="grid">
+<thead><tr><th>Agent</th><th>Trigger</th><th>Key isolation choices</th></tr></thead>
+<tbody>
+<tr><td><strong>Background review</strong> (<code class="cite">agent/background_review.py:1020</code>)</td><td>end of turn (<code class="cite">run_agent.py:1805</code>) or <code>/refine</code></td><td>16-iteration cap (<code class="cite">agent/background_review.py:48</code>); shares session id + cached prompt for cache parity; persistence hard-disabled (<code class="cite">agent/background_review.py:1062</code>); thread-local tool whitelist of memory/skill tools; registered on <code>_active_children</code> so interrupts reach it</td></tr>
+<tr><td><strong>Curator</strong> (<code class="cite">agent/curator.py:1932</code>)</td><td>idle</td><td><code>platform="curator"</code>, skills+terminal only, never spawns its own review</td></tr>
+<tr><td><strong>/background tasks</strong></td><td>user command</td><td>own <code>session_id=task_id</code>, own thread (CLI <code class="cite">hermes_cli/cli_commands_mixin.py:2151</code>, gateway <code class="cite">gateway/run.py:22241</code>)</td></tr>
+<tr><td><strong>Cron jobs</strong> (<code class="cite">cron/scheduler.py:5552</code>)</td><td>schedule</td><td>full <code>AIAgent</code> turn, <code>skip_memory</code>, own session, own toolsets</td></tr>
+<tr><td><strong>MoA references</strong> (<code class="cite">agent/moa_loop.py:795</code>)</td><td><code>/moa</code> turn</td><td>multi-<em>model</em>, not multi-agent: N parallel model calls injected as advisor text, no tools</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="absences">
+<h2>Consolidated absences</h2>
+<ul>
+<li>No model-authored orchestration programs; no conditionals, loops, or typed data-flow in any graph structure.</li>
+<li>No per-spawn model/effort/toolset selection by the model; no token or cost budgets (iterations + optional wall-clock + concurrency only).</li>
+<li>No <code>redirect</code> for subagents; no queueing of follow-ups to a child; no sibling messaging or shared mailbox.</li>
+<li>Cooperative-only cancellation for in-process children — a truly wedged thread can only be stall-finalized, not killed; real kills exist only at the OS-process tier.</li>
+<li>Worktree isolation off by default and git/local-only; children otherwise share the parent's working copy and container.</li>
+<li>No cron job dependencies or ordering (<code>context_from</code> is a stale read, not a barrier); no plugin-registered pipeline stages or middleware — hooks are a fixed event set, mostly observer-only.</li>
+</ul>
+</section>
+    </main>
+  </div>
+  <footer>
+    Hermes Agent fresh wiki · grounded 2026-08-19 against commit <code>42a4c91c4</code>
+    for <code>IgorTavcar/hermes-agent</code> (fork of <code>NousResearch/hermes-agent</code>);
+    citations are <code>path:line</code> into the working tree; diagrams render offline via vendored mermaid.
+  </footer>
+  <script>
+    const links = [...document.querySelectorAll('.sidebar a')];
+    const map = new Map(links.map(a => [a.getAttribute('href').slice(1), a]));
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          links.forEach(a => a.classList.remove('active'));
+          const a = map.get(e.target.id);
+          if (a) a.classList.add('active');
+        }
+      });
+    }, { rootMargin: '-80px 0px -70% 0px' });
+    document.querySelectorAll('main section[id]').forEach(s => obs.observe(s));
+  </script>
+</body>
+</html>

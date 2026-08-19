@@ -14,6 +14,7 @@
     { file: "providers.html",    title: "Providers & Tiers" },
     { file: "channels.html",     title: "Channels" },
     { file: "multimodal.html",   title: "Multimodal I/O" },
+    { file: "orchestration.html", title: "Orchestration" },
     { file: "skills.html",       title: "Self-Adaptive Skills" },
     { file: "transfer.html",     title: "Transferables" }
   ];
